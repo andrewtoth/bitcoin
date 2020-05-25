@@ -908,6 +908,8 @@ CBlockFileInfo* GetBlockFileInfo(size_t n);
 /** Dump the mempool to disk. */
 bool DumpMempool(const CTxMemPool& pool);
 
+bool DumpConnectTimes();
+
 /** Load the mempool from disk. */
 bool LoadMempool(CTxMemPool& pool);
 

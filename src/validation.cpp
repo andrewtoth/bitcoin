@@ -2256,6 +2256,9 @@ CoinsCacheSizeState CChainState::GetCoinsCacheSizeState(
     return CoinsCacheSizeState::OK;
 }
 
+static std::vector<double> connect_times;
+static std::set<uint> flush_blocks;
+
 bool CChainState::FlushStateToDisk(
     const CChainParams& chainparams,
     BlockValidationState &state,
@@ -2358,6 +2361,7 @@ bool CChainState::FlushStateToDisk(
         }
         // Flush best chain related state. This can only be done if the blocks / block index write was also done.
         if (fDoFullFlush && !CoinsTip().GetBestBlock().IsNull()) {
+            flush_blocks.insert(connect_times.size());
             LOG_TIME_SECONDS(strprintf("write coins cache to disk (%d coins, %.2fkB)",
                 coins_count, coins_mem_usage / 1000));
 
@@ -2610,6 +2614,7 @@ bool CChainState::ConnectTip(BlockValidationState& state, const CChainParams& ch
         nTime3 = GetTimeMicros(); nTimeConnectTotal += nTime3 - nTime2;
         assert(nBlocksTotal > 0);
         LogPrint(BCLog::BENCH, "  - Connect total: %.2fms [%.2fs (%.2fms/blk)]\n", (nTime3 - nTime2) * MILLI, nTimeConnectTotal * MICRO, nTimeConnectTotal * MILLI / nBlocksTotal);
+        connect_times.push_back((nTime3 - nTime2) * MILLI);
         bool flushed = view.Flush();
         assert(flushed);
     }
@@ -5236,6 +5241,40 @@ bool DumpCoinsCache()
         LogPrintf("Dumped coins cache in %gs\n", (end-start)*MICRO);
     } catch (const std::exception& e) {
         LogPrintf("Failed to dump coins cache: %s. Continuing anyway.\n", e.what());
+        return false;
+    }
+    return true;
+}
+
+bool DumpConnectTimes()
+{
+    std::set<uint> flushed = flush_blocks;
+    static Mutex dump_mutex;
+    LOCK(dump_mutex);
+
+    try {
+        FILE* filestr = fsbridge::fopen(GetDataDir() / "connecttimes.dat.new", "wb");
+        if (!filestr) {
+            return false;
+        }
+
+        CAutoFile file(filestr, SER_DISK, CLIENT_VERSION);
+
+        for (uint i = 0; i < connect_times.size(); i++) {
+            if (flushed.find(i) != flushed.end()) {
+                fprintf(file.Get(), "%d,%.2f,true\n", i, connect_times[i]);
+            } else {
+                fprintf(file.Get(), "%d,%.2f,\n", i, connect_times[i]);
+            }
+        }
+
+        if (!FileCommit(file.Get()))
+            throw std::runtime_error("FileCommit failed");
+        file.fclose();
+        RenameOver(GetDataDir() / "connecttimes.dat.new", GetDataDir() / "connecttimes.dat");
+        LogPrintf("Dumped connect times\n");
+    } catch (const std::exception& e) {
+        LogPrintf("Failed to dump connect times: %s. Continuing anyway.\n", e.what());
         return false;
     }
     return true;
