@@ -2360,7 +2360,7 @@ bool CChainState::FlushStateToDisk(
             nLastWrite = nNow;
         }
         // Flush best chain related state. This can only be done if the blocks / block index write was also done.
-        if (fDoFullFlush && !CoinsTip().GetBestBlock().IsNull()) {
+        if (!CoinsTip().GetBestBlock().IsNull()) {
             flush_blocks.insert(connect_times.size());
             LOG_TIME_SECONDS(strprintf("write coins cache to disk (%d coins, %.2fkB)",
                 coins_count, coins_mem_usage / 1000));
