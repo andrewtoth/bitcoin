@@ -2294,14 +2294,10 @@ bool CChainState::FlushStateToDisk(
     std::set<int> setFilesToPrune;
     bool full_flush_completed = false;
 
-    const size_t coins_count = CoinsTip().GetCacheSize();
-    const size_t coins_mem_usage = CoinsTip().DynamicMemoryUsage();
-
     try {
     {
         bool fFlushForPrune = false;
         bool fDoFullFlush = false;
-        CoinsCacheSizeState cache_state = GetCoinsCacheSizeState(::mempool);
         LOCK(cs_LastBlockFile);
         if (fPruneMode && (fCheckForPruning || nManualPruneHeight > 0) && !fReindex) {
             if (nManualPruneHeight > 0) {
@@ -2331,9 +2327,9 @@ bool CChainState::FlushStateToDisk(
             nLastFlush = nNow;
         }
         // The cache is large and we're within 10% and 10 MiB of the limit, but we have time now (not in the middle of a block processing).
-        bool fCacheLarge = mode == FlushStateMode::PERIODIC && cache_state >= CoinsCacheSizeState::LARGE;
+        bool fCacheLarge = mode == FlushStateMode::PERIODIC && GetCoinsCacheSizeState(::mempool) >= CoinsCacheSizeState::LARGE;
         // The cache is over the limit, we have to write now.
-        bool fCacheCritical = mode == FlushStateMode::IF_NEEDED && cache_state >= CoinsCacheSizeState::CRITICAL;
+        bool fCacheCritical = mode == FlushStateMode::IF_NEEDED && GetCoinsCacheSizeState(::mempool) >= CoinsCacheSizeState::CRITICAL;
         // It's been a while since we wrote the block index to disk. Do this frequently, so we don't need to redownload after a crash.
         bool fPeriodicWrite = mode == FlushStateMode::PERIODIC && nNow > nLastWrite + DATABASE_WRITE_INTERVAL;
         // It's been very long since we flushed the cache. Do this infrequently, to optimize cache usage.
@@ -2383,6 +2379,8 @@ bool CChainState::FlushStateToDisk(
         }
         // Flush best chain related state. This can only be done if the blocks / block index write was also done.
         if (fDoFullFlush && !CoinsTip().GetBestBlock().IsNull()) {
+            const size_t coins_count = CoinsTip().GetCacheSize();
+            const size_t coins_mem_usage = CoinsTip().DynamicMemoryUsage();
             LOG_TIME_SECONDS(strprintf("write coins cache to disk (%d coins, %.2fkB)",
                 coins_count, coins_mem_usage / 1000));
 
