@@ -2551,7 +2551,9 @@ bool CChainState::DisconnectTip(BlockValidationState& state, const CChainParams&
     return true;
 }
 
+static int64_t nTimeWarmingBlock = 0;
 static int64_t nTimeReadFromDisk = 0;
+static int64_t nTimeWaitingForWarmBlockThread = 0;
 static int64_t nTimeConnectTotal = 0;
 static int64_t nTimeFlush = 0;
 static int64_t nTimeChainState = 0;
@@ -2624,6 +2626,8 @@ bool CChainState::ConnectTip(BlockValidationState& state, const CChainParams& ch
     LogPrint(BCLog::BENCH, "  - Load block from disk: %.2fms [%.2fs]\n", (nTime2 - nTime1) * MILLI, nTimeReadFromDisk * MICRO);
     {
         CCoinsViewCache view(&CoinsTip());
+        int64_t nTimeDoneWarming = GetTimeMicros(); nTimeWaitingForWarmBlockThread += nTimeDoneWarming - nTime2;
+        LogPrint(BCLog::BENCH, "  - Acquired lock from block warming thread: %.2fms [%.2fs]\n", MILLI * (nTimeDoneWarming - nTime2), nTimeWaitingForWarmBlockThread * MICRO);
         bool rv = ConnectBlock(blockConnecting, state, pindexNew, view, chainparams);
         GetMainSignals().BlockChecked(blockConnecting, state);
         if (!rv) {
@@ -3862,6 +3866,7 @@ void CChainState::ThreadWarmCoinsCache()
         while (m_finished_warming_block) {
             m_warm_cv.wait(lock);
         }
+        int64_t nTime1 = GetTimeMicros();
         if (m_warm_block == nullptr) {
             m_finished_warming_block = true;
             continue;
@@ -3878,6 +3883,8 @@ void CChainState::ThreadWarmCoinsCache()
         }
         m_warm_block = nullptr;
         m_finished_warming_block = true;
+        int64_t nTime2 = GetTimeMicros(); nTimeWarmingBlock += nTime2 - nTime1;
+        LogPrint(BCLog::BENCH, "- Warmed coins cache for: %.2fms [%.2fs]\n", MILLI * (nTime2 - nTime1), nTimeWarmingBlock * MICRO);
     }
 }
 
