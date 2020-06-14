@@ -2395,6 +2395,7 @@ bool CChainState::FlushStateToDisk(
             // Flush the chainstate (which may refer to block index entries).
             if (!CoinsTip().Flush())
                 return AbortNode(state, "Failed to write to coin database");
+            m_did_flush = true;
             nLastFlush = nNow;
             full_flush_completed = true;
         }
@@ -3845,6 +3846,79 @@ bool CChainState::AcceptBlock(const std::shared_ptr<const CBlock>& pblock, Block
     return true;
 }
 
+void CChainState::ThreadWarmCoinsCache()
+{
+    util::ThreadRename("warmcoins");
+    ScheduleBatchPriority();
+
+    CCoinsViewCache* cache;
+    {
+        LOCK(cs_main);
+        cache = &CoinsTip();
+    }
+
+    while (!ShutdownRequested()) {
+        WAIT_LOCK(m_cs_warm_block, lock);
+        while (m_finished_warming_block) {
+            m_warm_cv.wait(lock);
+        }
+        if (m_warm_block == nullptr) {
+            m_finished_warming_block = true;
+            continue;
+        }
+        for (const auto& tx : m_warm_block->vtx) {
+            if (tx->IsCoinBase()) {
+                continue;
+            }
+            for (const auto& input : tx->vin) {
+                if (m_finished_warming_block) break;
+                cache->AccessCoin(input.prevout);
+            }
+            if (m_finished_warming_block) break;
+        }
+        m_warm_block = nullptr;
+        m_finished_warming_block = true;
+    }
+}
+
+void CChainState::WarmBlock(const std::shared_ptr<const CBlock> pblock)
+{
+    AssertLockHeld(cs_main);
+
+    if (!m_start_warming) {
+        if (!m_did_flush) {
+            return;
+        }
+        // If we are starting IBD from genesis, then wait for an initial flush to start warming.
+        // Warming is not useful when performing IBD from genesis and no flush has yet occurred,
+        // since all possible coins are already in the cache. Only begin warming on the warm coins
+        // thread when we have made an initial flush.
+        if (m_chain.Height() == 0) {
+            m_did_flush = false;
+            return;
+        }
+        m_start_warming = true;
+    }
+    LOCK(m_cs_warm_block);
+    m_warm_block = pblock;
+    m_finished_warming_block = false;
+    m_warm_cv.notify_all();
+}
+
+void CChainState::CancelWarmingBlock()
+{
+    m_finished_warming_block = true;
+}
+
+void CChainState::StopWarmCoinsThread()
+{
+    m_finished_warming_block = true;
+    LOCK(m_cs_warm_block);
+    m_warm_block = nullptr;
+    m_finished_warming_block = false;
+    m_warm_cv.notify_all();
+}
+
 bool ChainstateManager::ProcessNewBlock(const CChainParams& chainparams, const std::shared_ptr<const CBlock> pblock, bool fForceProcessing, bool* fNewBlock)
 {
     AssertLockNotHeld(cs_main);
@@ -3858,6 +3932,9 @@ bool ChainstateManager::ProcessNewBlock(const CChainParams& chainparams, const s
         // Therefore, the following critical section must include the CheckBlock() call as well.
         LOCK(cs_main);
 
+        // Before doing any checks, begin warming the cache to process this block
+        ::ChainstateActive().WarmBlock(pblock);
+
         // Ensure that CheckBlock() passes before calling AcceptBlock, as
         // belt-and-suspenders.
         bool ret = CheckBlock(*pblock, state, chainparams.GetConsensus());
@@ -3866,6 +3943,7 @@ bool ChainstateManager::ProcessNewBlock(const CChainParams& chainparams, const s
             ret = ::ChainstateActive().AcceptBlock(pblock, state, chainparams, &pindex, fForceProcessing, nullptr, fNewBlock);
         }
         if (!ret) {
+            ::ChainstateActive().CancelWarmingBlock();
             GetMainSignals().BlockChecked(*pblock, state);
             return error("%s: AcceptBlock FAILED (%s)", __func__, state.ToString());
         }
@@ -3874,8 +3952,10 @@ bool ChainstateManager::ProcessNewBlock(const CChainParams& chainparams, const s
     NotifyHeaderTip();
 
     BlockValidationState state; // Only used to report errors, not invalidity - ignore it
-    if (!::ChainstateActive().ActivateBestChain(state, chainparams, pblock))
+    if (!::ChainstateActive().ActivateBestChain(state, chainparams, pblock)) {
+        ::ChainstateActive().CancelWarmingBlock();
         return error("%s: ActivateBestChain failed (%s)", __func__, state.ToString());
+    }
 
     return true;
 }

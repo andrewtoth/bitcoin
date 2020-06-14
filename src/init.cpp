@@ -188,6 +188,7 @@ void Shutdown(NodeContext& node)
     StopREST();
     StopRPC();
     StopHTTPServer();
+    ::ChainstateActive().StopWarmCoinsThread();
     for (const auto& client : node.chain_clients) {
         client->flush();
     }
@@ -739,6 +740,8 @@ static void ThreadImport(ChainstateManager& chainman, std::vector<fs::path> vImp
             return;
         }
     }
+
+    threadGroup.create_thread([]{ return ::ChainstateActive().ThreadWarmCoinsCache(); });
 
     if (gArgs.GetBoolArg("-stopafterblockimport", DEFAULT_STOPAFTERBLOCKIMPORT)) {
         LogPrintf("Stopping after block import\n");

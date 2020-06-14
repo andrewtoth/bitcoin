@@ -505,6 +505,27 @@ private:
     //! Manages the UTXO set, which is a reflection of the contents of `m_chain`.
     std::unique_ptr<CoinsViews> m_coins_views;
 
+    /** Lock that is held when accessing the coins cache so coins aren't accessed during warming */
+    Mutex m_cs_warm_block;
+
+    /** Stops the warm coins thread from warming the block */
+    std::atomic<bool> m_finished_warming_block{true};
+
+    /** The block to warm on the warm coins thread */
+    std::shared_ptr<const CBlock> m_warm_block{nullptr};
+
+    /** Signals to the warm coins thread to begin warming the block */
+    std::condition_variable m_warm_cv;
+
+    /**
+     * Whether a coins cache flush has occurred during this run.
+     * Init to true because we assume there was a flush at last shutdown.
+     */
+    bool m_did_flush{true};
+
+    /** Whether the warm coins thread is ready to warm blocks */
+    bool m_start_warming{false};
+
 public:
     explicit CChainState(BlockManager& blockman, uint256 from_snapshot_blockhash = uint256());
 
@@ -548,10 +569,21 @@ public:
      */
     std::set<CBlockIndex*, CBlockIndexWorkComparator> setBlockIndexCandidates;
 
-    //! @returns A reference to the in-memory cache of the UTXO set.
+    /**
+     * @returns A reference to the in-memory cache of the UTXO set.
+     * Don't call this in the critical path from ProcessNewBlock to ConnectTip,
+     * since it will block warming the cache with the new block's inputs.
+     */
     CCoinsViewCache& CoinsTip() EXCLUSIVE_LOCKS_REQUIRED(cs_main)
     {
         assert(m_coins_views->m_cacheview);
+        // No need to hold the warm block lock if we aren't warming coins yet
+        if (!m_start_warming) {
+          return *m_coins_views->m_cacheview.get();
+        }
+        // Signal to the warm coins thread to stop warming so we can take the lock
+        m_finished_warming_block = true;
+        LOCK(m_cs_warm_block);
         return *m_coins_views->m_cacheview.get();
     }
 
@@ -663,6 +695,14 @@ public:
         size_t max_mempool_size_bytes) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
     std::string ToString() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
+    /** Begin adding the inputs of the block to the coins cache on the warm coins thread */
+    void WarmBlock(const std::shared_ptr<const CBlock> pblock) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    void CancelWarmingBlock();
+
+    /** Separate thread for warming the block so prevalidation checks aren't blocked */
+    void ThreadWarmCoinsCache();
+    void StopWarmCoinsThread();
 
 private:
     bool ActivateBestChainStep(BlockValidationState& state, const CChainParams& chainparams, CBlockIndex* pindexMostWork, const std::shared_ptr<const CBlock>& pblock, bool& fInvalidFound, ConnectTrace& connectTrace) EXCLUSIVE_LOCKS_REQUIRED(cs_main, ::mempool.cs);
