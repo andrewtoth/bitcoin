@@ -230,6 +230,8 @@ void Shutdown(NodeContext& node)
         DumpMempool(::mempool);
     }
 
+    DumpConnectTimes();
+
     if (fFeeEstimatesInitialized)
     {
         ::feeEstimator.FlushUnconfirmed();

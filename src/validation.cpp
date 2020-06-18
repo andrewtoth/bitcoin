@@ -2599,6 +2599,9 @@ public:
     }
 };
 
+static int64_t previous_connect_time = 0;
+static std::vector<double> connect_times;
+
 /**
  * Connect a new block to m_chain. pblock is either nullptr or a pointer to a CBlock
  * corresponding to pindexNew, to bypass loading it again from disk.
@@ -2636,6 +2639,7 @@ bool CChainState::ConnectTip(BlockValidationState& state, const CChainParams& ch
             return error("%s: ConnectBlock %s failed, %s", __func__, pindexNew->GetBlockHash().ToString(), state.ToString());
         }
         nTime3 = GetTimeMicros(); nTimeConnectTotal += nTime3 - nTime2;
+        connect_times.push_back(nTime3 - previous_connect_time);
         assert(nBlocksTotal > 0);
         LogPrint(BCLog::BENCH, "  - Connect total: %.2fms [%.2fs (%.2fms/blk)]\n", (nTime3 - nTime2) * MILLI, nTimeConnectTotal * MICRO, nTimeConnectTotal * MILLI / nBlocksTotal);
         bool flushed = view.Flush();
@@ -3929,6 +3933,7 @@ void CChainState::StopWarmCoinsThread()
 bool ChainstateManager::ProcessNewBlock(const CChainParams& chainparams, const std::shared_ptr<const CBlock> pblock, bool fForceProcessing, bool* fNewBlock)
 {
     AssertLockNotHeld(cs_main);
+    previous_connect_time = GetTimeMicros();
 
     {
         CBlockIndex *pindex = nullptr;
@@ -3964,6 +3969,35 @@ bool ChainstateManager::ProcessNewBlock(const CChainParams& chainparams, const s
         return error("%s: ActivateBestChain failed (%s)", __func__, state.ToString());
     }
 
+    return true;
+}
+
+bool DumpConnectTimes()
+{
+    static Mutex dump_mutex;
+    LOCK(dump_mutex);
+
+    try {
+        FILE* filestr = fsbridge::fopen(GetDataDir() / "connecttimes.dat.new", "wb");
+        if (!filestr) {
+            return false;
+        }
+
+        CAutoFile file(filestr, SER_DISK, CLIENT_VERSION);
+
+        for (uint i = 0; i < connect_times.size(); i++) {
+            fprintf(file.Get(), "%d,%.2f\n", i, connect_times[i]);
+        }
+
+        if (!FileCommit(file.Get()))
+            throw std::runtime_error("FileCommit failed");
+        file.fclose();
+        RenameOver(GetDataDir() / "connecttimes.dat.new", GetDataDir() / "connecttimes.dat");
+        LogPrintf("Dumped connect times\n");
+    } catch (const std::exception& e) {
+        LogPrintf("Failed to dump connect times: %s. Continuing anyway.\n", e.what());
+        return false;
+    }
     return true;
 }
 
