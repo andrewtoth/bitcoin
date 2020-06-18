@@ -3910,6 +3910,7 @@ void CChainState::WarmBlock(const std::shared_ptr<const CBlock> pblock)
         }
         m_start_warming = true;
     }
+    m_finished_warming_block = true;
     LOCK(m_cs_warm_block);
     m_warm_block = pblock;
     m_finished_warming_block = false;
