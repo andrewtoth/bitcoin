@@ -72,6 +72,13 @@ class AnchorsTest(BitcoinTestFramework):
             ip_port = ip + port
             assert ip_port not in anchors
 
+        if os.name == 'nt':
+            with open(node_anchors_path, "r") as file_handler:
+                self.log.info("Start node on Windows with anchor.dat file handle to verify handling failed deletion")
+                self.start_node(0)
+                assert os.path.exists(node_anchors_path)
+                self.stop_node(0)
+
         self.log.info("Start node")
         self.start_node(0)
 
