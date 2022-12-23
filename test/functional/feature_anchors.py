@@ -72,11 +72,14 @@ class AnchorsTest(BitcoinTestFramework):
             ip_port = ip + port
             assert ip_port not in anchors
 
-        self.log.info("Start node")
-        self.start_node(0)
+        with open(node_anchors_path, "rb") as file_handler:
+            self.log.info("Start node")
+            self.start_node(0)
 
-        self.log.info("When node starts, check if anchors.dat doesn't exist anymore")
-        assert not os.path.exists(node_anchors_path)
+            self.nodes[0].getblockchaininfo()
+
+            self.log.info("When node starts, check if anchors.dat doesn't exist anymore")
+            assert not os.path.exists(node_anchors_path)
 
 
 if __name__ == "__main__":
