@@ -150,6 +150,17 @@ using CCoinsMap = std::unordered_map<COutPoint,
 
 using CCoinsMapMemoryResource = CCoinsMap::allocator_type::ResourceType;
 
+using DirtyCoinsMap = std::unordered_map<const std::reference_wrapper<const COutPoint>,
+                                     CCoinsCacheEntry*,
+                                     SaltedOutpointHasher,
+                                     std::equal_to<const std::reference_wrapper<const COutPoint>>,
+                                     PoolAllocator<std::pair<const std::reference_wrapper<const COutPoint>, CCoinsCacheEntry*>,
+                                                   sizeof(std::pair<const std::reference_wrapper<const COutPoint>, CCoinsCacheEntry*>) + sizeof(void*) * 4,
+                                                   alignof(void*)>>;
+
+using DirtyCoinsMapMemoryResource = DirtyCoinsMap::allocator_type::ResourceType;
+
+
 /** Cursor for iterating over CoinsView state */
 class CCoinsViewCursor
 {
@@ -193,7 +204,7 @@ public:
 
     //! Do a bulk modification (multiple Coin changes + BestBlock change).
     //! The passed mapCoins can be modified.
-    virtual bool BatchWrite(CCoinsMap &mapCoins, const uint256 &hashBlock, bool erase = true);
+    virtual bool BatchWrite(DirtyCoinsMap &mapCoins, const uint256 &hashBlock, bool erase = true);
 
     //! Get a cursor to iterate over the whole state
     virtual std::unique_ptr<CCoinsViewCursor> Cursor() const;
@@ -219,7 +230,7 @@ public:
     uint256 GetBestBlock() const override;
     std::vector<uint256> GetHeadBlocks() const override;
     void SetBackend(CCoinsView &viewIn);
-    bool BatchWrite(CCoinsMap &mapCoins, const uint256 &hashBlock, bool erase = true) override;
+    bool BatchWrite(DirtyCoinsMap &mapCoins, const uint256 &hashBlock, bool erase = true) override;
     std::unique_ptr<CCoinsViewCursor> Cursor() const override;
     size_t EstimateSize() const override;
 };
@@ -239,6 +250,8 @@ protected:
     mutable uint256 hashBlock;
     mutable CCoinsMapMemoryResource m_cache_coins_memory_resource{};
     mutable CCoinsMap cacheCoins;
+    mutable DirtyCoinsMapMemoryResource dirty_coins_memory_resource{};
+    mutable DirtyCoinsMap dirty_coins;
 
     /* Cached dynamic memory usage for the inner Coin objects. */
     mutable size_t cachedCoinsUsage{0};
@@ -256,7 +269,7 @@ public:
     bool HaveCoin(const COutPoint &outpoint) const override;
     uint256 GetBestBlock() const override;
     void SetBestBlock(const uint256 &hashBlock);
-    bool BatchWrite(CCoinsMap &mapCoins, const uint256 &hashBlock, bool erase = true) override;
+    bool BatchWrite(DirtyCoinsMap &mapCoins, const uint256 &hashBlock, bool erase = true) override;
     std::unique_ptr<CCoinsViewCursor> Cursor() const override {
         throw std::logic_error("CCoinsViewCache cursor iteration not supported.");
     }
@@ -340,6 +353,7 @@ public:
     //!
     //! See: https://stackoverflow.com/questions/42114044/how-to-release-unordered-map-memory
     void ReallocateCache();
+    void ReallocateDirtyCoins();
 
     //! Run an internal sanity check on the cache data structure. */
     void SanityCheck() const;
