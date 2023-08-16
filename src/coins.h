@@ -103,8 +103,16 @@ public:
  */
 struct CCoinsCacheEntry
 {
+private:
+    //! These are used to create a doubly linked list of dirty entries. They are
+    //! set in SetFlags and unset in ClearFlags.
+    CCoinsCacheEntry *m_prev{nullptr};
+    CCoinsCacheEntry *m_next{nullptr};
+    const COutPoint *m_outpoint{nullptr};
+    unsigned char m_flags{0};
+
+public:
     Coin coin; // The actual cached data.
-    unsigned char flags;
 
     enum Flags {
         /**
@@ -127,9 +135,26 @@ struct CCoinsCacheEntry
         FRESH = (1 << 1),
     };
 
-    CCoinsCacheEntry() : flags(0) {}
-    explicit CCoinsCacheEntry(Coin&& coin_) : coin(std::move(coin_)), flags(0) {}
-    CCoinsCacheEntry(Coin&& coin_, unsigned char flag) : coin(std::move(coin_)), flags(flag) {}
+    CCoinsCacheEntry() {}
+    explicit CCoinsCacheEntry(Coin&& coin_) : coin(std::move(coin_)) {}
+
+    //! Setting a flag also requires a pointer to the head of the flagged entry
+    //! linked list, and a pointer to its corresponding outpoint in the cache
+    //! map. Care must be taken to call ClearFlags before erasing the entry from
+    //! the CCoinsCache map, since the cache map owns the entry. Erasing before
+    //! calling ClearFlags will cause a use-after-free, since the linked list
+    //! will still reference the now erased entry.
+    void SetFlags(unsigned char flags, CCoinsCacheEntry *ptr, const COutPoint *outpoint);
+    void ClearFlags();
+    unsigned char GetFlags() const { return m_flags; }
+
+    //! Get the next entry in the dirty linked list, optionally removing the
+    //! current entry and clearing the flags.
+    CCoinsCacheEntry *Next(bool clear_flags = false);
+    //! Get a reference to the outpoint of this entry.
+    //! WARNING: This is only safe to call if m_flags != 0, otherwise it will
+    //! be dereferencing nullptr.
+    const COutPoint& GetOutPoint() const { return *m_outpoint; }
 };
 
 /**
@@ -193,7 +218,7 @@ public:
 
     //! Do a bulk modification (multiple Coin changes + BestBlock change).
     //! The passed mapCoins can be modified.
-    virtual bool BatchWrite(CCoinsMap &mapCoins, const uint256 &hashBlock, bool erase = true);
+    virtual bool BatchWrite(CCoinsCacheEntry *entries, const uint256 &hashBlock, bool erase = true);
 
     //! Get a cursor to iterate over the whole state
     virtual std::unique_ptr<CCoinsViewCursor> Cursor() const;
@@ -219,7 +244,7 @@ public:
     uint256 GetBestBlock() const override;
     std::vector<uint256> GetHeadBlocks() const override;
     void SetBackend(CCoinsView &viewIn);
-    bool BatchWrite(CCoinsMap &mapCoins, const uint256 &hashBlock, bool erase = true) override;
+    bool BatchWrite(CCoinsCacheEntry *entries, const uint256 &hashBlock, bool erase = true) override;
     std::unique_ptr<CCoinsViewCursor> Cursor() const override;
     size_t EstimateSize() const override;
 };
@@ -239,6 +264,7 @@ protected:
     mutable uint256 hashBlock;
     mutable CCoinsMapMemoryResource m_cache_coins_memory_resource{};
     mutable CCoinsMap cacheCoins;
+    mutable CCoinsCacheEntry m_flagged_head{};
 
     /* Cached dynamic memory usage for the inner Coin objects. */
     mutable size_t cachedCoinsUsage{0};
@@ -256,7 +282,7 @@ public:
     bool HaveCoin(const COutPoint &outpoint) const override;
     uint256 GetBestBlock() const override;
     void SetBestBlock(const uint256 &hashBlock);
-    bool BatchWrite(CCoinsMap &mapCoins, const uint256 &hashBlock, bool erase = true) override;
+    bool BatchWrite(CCoinsCacheEntry *entries, const uint256 &hashBlock, bool erase = true) override;
     std::unique_ptr<CCoinsViewCursor> Cursor() const override {
         throw std::logic_error("CCoinsViewCache cursor iteration not supported.");
     }
