@@ -55,15 +55,15 @@ public:
 
     uint256 GetBestBlock() const override { return hashBestBlock_; }
 
-    bool BatchWrite(CCoinsMap& mapCoins, const uint256& hashBlock, bool erase = true) override
+    bool BatchWrite(CCoinsCacheEntry *entries, const uint256& hashBlock, bool erase = true) override
     {
-        for (CCoinsMap::iterator it = mapCoins.begin(); it != mapCoins.end(); it = erase ? mapCoins.erase(it) : std::next(it)) {
-            if (it->second.flags & CCoinsCacheEntry::DIRTY) {
+        for (auto it{entries}; it != nullptr; it = it->Next(erase)) {
+            if (it->GetFlags() & CCoinsCacheEntry::DIRTY) {
                 // Same optimization used in CCoinsViewDB is to only write dirty entries.
-                map_[it->first] = it->second.coin;
-                if (it->second.coin.IsSpent() && InsecureRandRange(3) == 0) {
+                map_[it->GetOutPoint()] = it->coin;
+                if (it->coin.IsSpent() && InsecureRandRange(3) == 0) {
                     // Randomly delete empty entries on write.
-                    map_.erase(it->first);
+                    map_.erase(it->GetOutPoint());
                 }
             }
         }
@@ -92,6 +92,7 @@ public:
     }
 
     CCoinsMap& map() const { return cacheCoins; }
+    CCoinsCacheEntry& entries() const { return m_flagged_head; }
     size_t& usage() const { return cachedCoinsUsage; }
 };
 
@@ -579,7 +580,7 @@ static void SetCoinsValue(CAmount value, Coin& coin)
     }
 }
 
-static size_t InsertCoinsMapEntry(CCoinsMap& map, CAmount value, char flags)
+static size_t InsertCoinsMapEntry(CCoinsMap& map, CCoinsCacheEntry& flagged_head, CAmount value, char flags)
 {
     if (value == ABSENT) {
         assert(flags == NO_ENTRY);
@@ -587,10 +588,12 @@ static size_t InsertCoinsMapEntry(CCoinsMap& map, CAmount value, char flags)
     }
     assert(flags != NO_ENTRY);
     CCoinsCacheEntry entry;
-    entry.flags = flags;
     SetCoinsValue(value, entry.coin);
     auto inserted = map.emplace(OUTPOINT, std::move(entry));
     assert(inserted.second);
+    if (flags != 0) {
+        inserted.first->second.SetFlags(flags, &flagged_head, &inserted.first->first);
+    }
     return inserted.first->second.coin.DynamicMemoryUsage();
 }
 
@@ -606,7 +609,7 @@ void GetCoinsMapEntry(const CCoinsMap& map, CAmount& value, char& flags, const C
         } else {
             value = it->second.coin.out.nValue;
         }
-        flags = it->second.flags;
+        flags = it->second.GetFlags();
         assert(flags != NO_ENTRY);
     }
 }
@@ -615,8 +618,9 @@ void WriteCoinsViewEntry(CCoinsView& view, CAmount value, char flags)
 {
     CCoinsMapMemoryResource resource;
     CCoinsMap map{0, CCoinsMap::hasher{}, CCoinsMap::key_equal{}, &resource};
-    InsertCoinsMapEntry(map, value, flags);
-    BOOST_CHECK(view.BatchWrite(map, {}));
+    CCoinsCacheEntry flagged_head;
+    InsertCoinsMapEntry(map, flagged_head, value, flags);
+    BOOST_CHECK(view.BatchWrite(flagged_head.Next(), {}));
 }
 
 class SingleEntryCacheTest
@@ -625,7 +629,7 @@ public:
     SingleEntryCacheTest(CAmount base_value, CAmount cache_value, char cache_flags)
     {
         WriteCoinsViewEntry(base, base_value, base_value == ABSENT ? NO_ENTRY : DIRTY);
-        cache.usage() += InsertCoinsMapEntry(cache.map(), cache_value, cache_flags);
+        cache.usage() += InsertCoinsMapEntry(cache.map(), cache.entries(), cache_value, cache_flags);
     }
 
     CCoinsView root;
