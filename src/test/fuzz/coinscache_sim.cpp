@@ -170,27 +170,27 @@ public:
     std::unique_ptr<CCoinsViewCursor> Cursor() const final { return {}; }
     size_t EstimateSize() const final { return m_data.size(); }
 
-    bool BatchWrite(CCoinsMap& data, const uint256&, bool erase) final
+    bool BatchWrite(CCoinsCacheEntry* entries, const uint256&, bool erase) final
     {
-        for (auto it = data.begin(); it != data.end(); it = erase ? data.erase(it) : std::next(it)) {
-            if (it->second.flags & CCoinsCacheEntry::DIRTY) {
-                if (it->second.coin.IsSpent() && (it->first.n % 5) != 4) {
-                    m_data.erase(it->first);
+        for (auto it{entries}; it != nullptr; it = it->Next(erase)) {
+            if (it->GetFlags() & CCoinsCacheEntry::DIRTY) {
+                if (it->coin.IsSpent() && (it->GetOutPoint().n % 5) != 4) {
+                    m_data.erase(it->GetOutPoint());
                 } else if (erase) {
-                    m_data[it->first] = std::move(it->second.coin);
+                    m_data[it->GetOutPoint()] = std::move(it->coin);
                 } else {
-                    m_data[it->first] = it->second.coin;
+                    m_data[it->GetOutPoint()] = it->coin;
                 }
             } else {
                 /* For non-dirty entries being written, compare them with what we have. */
-                auto it2 = m_data.find(it->first);
-                if (it->second.coin.IsSpent()) {
+                auto it2 = m_data.find(it->GetOutPoint());
+                if (it->coin.IsSpent()) {
                     assert(it2 == m_data.end() || it2->second.IsSpent());
                 } else {
                     assert(it2 != m_data.end());
-                    assert(it->second.coin.out == it2->second.out);
-                    assert(it->second.coin.fCoinBase == it2->second.fCoinBase);
-                    assert(it->second.coin.nHeight == it2->second.nHeight);
+                    assert(it->coin.out == it2->second.out);
+                    assert(it->coin.fCoinBase == it2->second.fCoinBase);
+                    assert(it->coin.nHeight == it2->second.nHeight);
                 }
             }
         }

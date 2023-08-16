@@ -116,9 +116,10 @@ FUZZ_TARGET(coins_view, .init = initialize_coins_view)
             [&] {
                 CCoinsMapMemoryResource resource;
                 CCoinsMap coins_map{0, SaltedOutpointHasher{/*deterministic=*/true}, CCoinsMap::key_equal{}, &resource};
+                CCoinsCacheEntry flagged_head;
                 LIMITED_WHILE(fuzzed_data_provider.ConsumeBool(), 10000) {
                     CCoinsCacheEntry coins_cache_entry;
-                    coins_cache_entry.flags = fuzzed_data_provider.ConsumeIntegral<unsigned char>();
+                    const auto flags{fuzzed_data_provider.ConsumeIntegral<unsigned char>()};
                     if (fuzzed_data_provider.ConsumeBool()) {
                         coins_cache_entry.coin = random_coin;
                     } else {
@@ -128,11 +129,14 @@ FUZZ_TARGET(coins_view, .init = initialize_coins_view)
                         }
                         coins_cache_entry.coin = *opt_coin;
                     }
-                    coins_map.emplace(random_out_point, std::move(coins_cache_entry));
+                    auto it{coins_map.emplace(random_out_point, std::move(coins_cache_entry)).first};
+                    if (flags != 0) {
+                        it->second.SetFlags(flags, &flagged_head, &it->first);
+                    }
                 }
                 bool expected_code_path = false;
                 try {
-                    coins_view_cache.BatchWrite(coins_map, fuzzed_data_provider.ConsumeBool() ? ConsumeUInt256(fuzzed_data_provider) : coins_view_cache.GetBestBlock());
+                    coins_view_cache.BatchWrite(flagged_head.Next(), fuzzed_data_provider.ConsumeBool() ? ConsumeUInt256(fuzzed_data_provider) : coins_view_cache.GetBestBlock());
                     expected_code_path = true;
                 } catch (const std::logic_error& e) {
                     if (e.what() == std::string{"FRESH flag misapplied to coin that exists in parent cache"}) {
