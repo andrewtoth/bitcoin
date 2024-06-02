@@ -12,7 +12,7 @@
 bool CCoinsView::GetCoin(const COutPoint &outpoint, Coin &coin) const { return false; }
 uint256 CCoinsView::GetBestBlock() const { return uint256(); }
 std::vector<uint256> CCoinsView::GetHeadBlocks() const { return std::vector<uint256>(); }
-bool CCoinsView::BatchWrite(CCoinsMap &mapCoins, const uint256 &hashBlock, bool erase) { return false; }
+bool CCoinsView::BatchWrite(CCoinsMap &mapCoins, size_t& childCachedCoinsUsage, const uint256 &hashBlock, bool erase) { return false; }
 std::unique_ptr<CCoinsViewCursor> CCoinsView::Cursor() const { return nullptr; }
 
 bool CCoinsView::HaveCoin(const COutPoint &outpoint) const
@@ -27,7 +27,7 @@ bool CCoinsViewBacked::HaveCoin(const COutPoint &outpoint) const { return base->
 uint256 CCoinsViewBacked::GetBestBlock() const { return base->GetBestBlock(); }
 std::vector<uint256> CCoinsViewBacked::GetHeadBlocks() const { return base->GetHeadBlocks(); }
 void CCoinsViewBacked::SetBackend(CCoinsView &viewIn) { base = &viewIn; }
-bool CCoinsViewBacked::BatchWrite(CCoinsMap &mapCoins, const uint256 &hashBlock, bool erase) { return base->BatchWrite(mapCoins, hashBlock, erase); }
+bool CCoinsViewBacked::BatchWrite(CCoinsMap &mapCoins, size_t& childCachedCoinsUsage, const uint256 &hashBlock, bool erase) { return base->BatchWrite(mapCoins, childCachedCoinsUsage, hashBlock, erase); }
 std::unique_ptr<CCoinsViewCursor> CCoinsViewBacked::Cursor() const { return base->Cursor(); }
 size_t CCoinsViewBacked::EstimateSize() const { return base->EstimateSize(); }
 
@@ -178,12 +178,18 @@ void CCoinsViewCache::SetBestBlock(const uint256 &hashBlockIn) {
     hashBlock = hashBlockIn;
 }
 
-bool CCoinsViewCache::BatchWrite(CCoinsMap &mapCoins, const uint256 &hashBlockIn, bool erase) {
+bool CCoinsViewCache::BatchWrite(CCoinsMap &mapCoins, size_t& childCachedCoinsUsage, const uint256 &hashBlockIn, bool erase) {
     for (CCoinsMap::iterator it = mapCoins.begin();
-            it != mapCoins.end();
-            it = erase ? mapCoins.erase(it) : std::next(it)) {
+            it != mapCoins.end(); ) {
         // Ignore non-dirty entries (optimization).
-        if (!(it->second.flags & CCoinsCacheEntry::DIRTY)) {
+        while (!(it->second.flags & CCoinsCacheEntry::DIRTY)) {
+            if (erase || it->second.coin.IsSpent()) {
+                childCachedCoinsUsage -= it->second.coin.DynamicMemoryUsage();
+                it = mapCoins.erase(it);
+            } else {
+                it->second.flags = 0;
+                it = std::next(it);
+            }
             continue;
         }
         CCoinsMap::iterator itUs = cacheCoins.find(it->first);
@@ -245,13 +251,20 @@ bool CCoinsViewCache::BatchWrite(CCoinsMap &mapCoins, const uint256 &hashBlockIn
                 // from being flushed to the grandparent.
             }
         }
+        if (erase || it->second.coin.IsSpent()) {
+            childCachedCoinsUsage -= it->second.coin.DynamicMemoryUsage();
+            it = mapCoins.erase(it);
+        } else {
+            it->second.flags = 0;
+            it = std::next(it);
+        }
     }
     hashBlock = hashBlockIn;
     return true;
 }
 
 bool CCoinsViewCache::Flush() {
-    bool fOk = base->BatchWrite(cacheCoins, hashBlock, /*erase=*/true);
+    bool fOk = base->BatchWrite(cacheCoins, cachedCoinsUsage, hashBlock, /*erase=*/true);
     if (fOk) {
         if (!cacheCoins.empty()) {
             /* BatchWrite must erase all cacheCoins elements when erase=true. */
@@ -265,18 +278,9 @@ bool CCoinsViewCache::Flush() {
 
 bool CCoinsViewCache::Sync()
 {
-    bool fOk = base->BatchWrite(cacheCoins, hashBlock, /*erase=*/false);
+    bool fOk = base->BatchWrite(cacheCoins, cachedCoinsUsage, hashBlock, /*erase=*/false);
     // Instead of clearing `cacheCoins` as we would in Flush(), just clear the
     // FRESH/DIRTY flags of any coin that isn't spent.
-    for (auto it = cacheCoins.begin(); it != cacheCoins.end(); ) {
-        if (it->second.coin.IsSpent()) {
-            cachedCoinsUsage -= it->second.coin.DynamicMemoryUsage();
-            it = cacheCoins.erase(it);
-        } else {
-            it->second.flags = 0;
-            ++it;
-        }
-    }
     return fOk;
 }
 
