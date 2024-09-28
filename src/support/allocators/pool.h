@@ -95,6 +95,8 @@ class PoolResource final
      */
     const size_t m_chunk_size_bytes;
 
+    size_t m_free_bytes{0};
+
     /**
      * Contains all allocated pools of memory, used to free the data in the destructor.
      */
@@ -162,6 +164,7 @@ class PoolResource final
         m_available_memory_it = new (storage) std::byte[m_chunk_size_bytes];
         m_available_memory_end = m_available_memory_it + m_chunk_size_bytes;
         m_allocated_chunks.emplace_back(m_available_memory_it);
+        m_free_bytes += m_chunk_size_bytes;
     }
 
     /**
@@ -212,6 +215,7 @@ public:
     void* Allocate(std::size_t bytes, std::size_t alignment)
     {
         if (IsFreeListUsable(bytes, alignment)) {
+            m_free_bytes -= bytes;
             const std::size_t num_alignments = NumElemAlignBytes(bytes);
             if (nullptr != m_free_lists[num_alignments]) {
                 // we've already got data in the pool's freelist, unlink one element and return the pointer
@@ -241,6 +245,7 @@ public:
     void Deallocate(void* p, std::size_t bytes, std::size_t alignment) noexcept
     {
         if (IsFreeListUsable(bytes, alignment)) {
+            m_free_bytes += bytes;
             const std::size_t num_alignments = NumElemAlignBytes(bytes);
             // put the memory block into the linked list. We can placement construct the FreeList
             // into the memory since we can be sure the alignment is correct.
@@ -265,6 +270,11 @@ public:
     [[nodiscard]] size_t ChunkSizeBytes() const
     {
         return m_chunk_size_bytes;
+    }
+
+    [[nodiscard]] size_t FreeBytes() const
+    {
+        return m_free_bytes;
     }
 };
 

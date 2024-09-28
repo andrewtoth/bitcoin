@@ -39,7 +39,8 @@ CCoinsViewCache::CCoinsViewCache(CCoinsView* baseIn, bool deterministic) :
 }
 
 size_t CCoinsViewCache::DynamicMemoryUsage() const {
-    return memusage::DynamicUsage(cacheCoins) + cachedCoinsUsage;
+    auto* pool_resource = cacheCoins.get_allocator().resource();
+    return memusage::DynamicUsage(cacheCoins) + cachedCoinsUsage - pool_resource->FreeBytes();
 }
 
 CCoinsMap::iterator CCoinsViewCache::FetchCoin(const COutPoint &outpoint) const {
