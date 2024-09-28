@@ -257,7 +257,6 @@ bool CCoinsViewCache::Flush() {
     bool fOk = base->BatchWrite(cursor, hashBlock);
     if (fOk) {
         cacheCoins.clear();
-        ReallocateCache();
     }
     cachedCoinsUsage = 0;
     return fOk;
