@@ -305,6 +305,20 @@ class CCoinsView
 public:
     //! Retrieve the Coin (unspent transaction output) for a given outpoint.
     virtual std::optional<Coin> GetCoin(const COutPoint& outpoint) const;
+    std::vector<Coin> GetCoins(const std::vector<COutPoint>& outpoints) const
+    {
+        std::vector<Coin> result(outpoints.size());
+        for (const auto& outpoint : outpoints)
+        {
+            if (auto coin = GetCoin(outpoint)) {
+                result.push_back(*coin);
+            } else {
+                assert(false); // TODO
+                return {};
+            }
+        }
+        return result;
+    }
 
     //! Just check whether a given outpoint is unspent.
     virtual bool HaveCoin(const COutPoint &outpoint) const;
@@ -461,7 +475,7 @@ public:
     size_t DynamicMemoryUsage() const;
 
     //! Check whether all prevouts of the transaction are present in the UTXO set represented by this view
-    bool HaveInputs(const CTransaction& tx) const;
+    bool ValidInputs(const CTransaction& tx) const;
 
     //! Force a reallocation of the cache map. This is required when downsizing
     //! the cache because the map's allocator may be hanging onto a lot of
