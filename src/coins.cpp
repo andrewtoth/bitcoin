@@ -294,28 +294,11 @@ unsigned int CCoinsViewCache::GetCacheSize() const {
     return cacheCoins.size();
 }
 
-bool CCoinsViewCache::ValidInputs(const CTransaction& tx) const
+bool CCoinsViewCache::HaveInputs(const CTransaction& tx) const
 {
-    if (tx.IsCoinBase()) return true;
-
-    std::vector<COutPoint> missing;
-    missing.reserve(tx.vin.size());
-    for (const auto& input : tx.vin) {
-        const COutPoint& outpoint = input.prevout;
-        if (auto it = cacheCoins.find(outpoint); it == cacheCoins.end()) {
-            missing.push_back(outpoint);
-        } else if (it->second.coin.IsSpent()) {
-            return false;
-        }
-    }
-    std::vector<Coin> fetched_coins = GetCoins(missing);
-    for (size_t i = 0; i < missing.size(); ++i) {
-        auto [it, inserted] = cacheCoins.try_emplace(missing[i]);
-        if (inserted) { // TODO how can this not be inserted if it was missing?
-            it->second.coin = std::move(fetched_coins[i]);
-            cachedCoinsUsage += it->second.coin.DynamicMemoryUsage();
-            if (it->second.coin.IsSpent()) {
-                it->second.AddFlags(CCoinsCacheEntry::FRESH, *it, m_sentinel);
+    if (!tx.IsCoinBase()) {
+        for (unsigned int i = 0; i < tx.vin.size(); i++) {
+            if (!HaveCoin(tx.vin[i].prevout)) {
                 return false;
             }
         }

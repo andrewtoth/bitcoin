@@ -197,7 +197,7 @@ FUZZ_TARGET(coins_view, .init = initialize_coins_view)
         (void)coins_view_cache.GetBestBlock();
         (void)coins_view_cache.GetCacheSize();
         (void)coins_view_cache.GetHeadBlocks();
-        (void)coins_view_cache.ValidInputs(CTransaction{random_mutable_transaction});
+        (void)coins_view_cache.HaveInputs(CTransaction{random_mutable_transaction});
     }
 
     {
