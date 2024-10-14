@@ -206,7 +206,7 @@ private:
     bool m_is_memory;
 
     std::optional<std::string> ReadImpl(Span<const std::byte> key) const;
-    std::vector<std::string> MultiReadImpl(std::vector<Span<const std::byte>> keys) const;
+    std::vector<std::string> MultiReadImpl(Span<std::string> keys) const;
     bool ExistsImpl(Span<const std::byte> key) const;
     size_t EstimateSizeImpl(Span<const std::byte> key1, Span<const std::byte> key2) const;
     auto& DBContext() const LIFETIMEBOUND { return *Assert(m_db_context); }
@@ -239,20 +239,25 @@ public:
     }
 
     template <typename K, typename V>
-    std::vector<V> MultiRead(const std::vector<K>& keys) const
+    std::vector<V> MultiRead(const Span<K>& keys) const
     {
-        std::vector<Span<const std::byte>> keySpans(keys.size());
+        std::vector<std::string> keySpans{};
+        keySpans.reserve(keys.size());
         for (const auto& key : keys) {
             DataStream ssKey{};
             ssKey.reserve(DBWRAPPER_PREALLOC_KEY_SIZE);
             ssKey << key;
-            keySpans.emplace_back(MakeByteSpan(ssKey));
+            keySpans.emplace_back(ssKey.str());
         }
 
         auto strValues = MultiReadImpl(keySpans);
 
-        std::vector<V> results(strValues.size());
+        std::vector<V> results{};
+        results.reserve(strValues.size());
         for (const auto& strValue : strValues) {
+            if (strValue.empty()) {
+                continue;
+            }
             try {
                 DataStream ssValue{MakeByteSpan(strValue)};
                 ssValue.Xor(obfuscate_key);

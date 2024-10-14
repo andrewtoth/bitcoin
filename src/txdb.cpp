@@ -69,7 +69,7 @@ bool CCoinsViewDB::GetCoin(const COutPoint &outpoint, Coin &coin) const {
     return m_db->Read(CoinEntry(&outpoint), coin);
 }
 
-std::vector<Coin> CCoinsViewDB::GetCoins(const std::vector<COutPoint>& outpoints) const
+std::vector<Coin> CCoinsViewDB::GetCoins(const Span<COutPoint>& outpoints) const
 {
     if (outpoints.empty()) return {};
     std::vector<CoinEntry> entries;

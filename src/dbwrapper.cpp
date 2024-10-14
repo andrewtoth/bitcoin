@@ -351,10 +351,12 @@ std::optional<std::string> CDBWrapper::ReadImpl(Span<const std::byte> key) const
     return strValue;
 }
 
-std::vector<std::string> CDBWrapper::MultiReadImpl(std::vector<Span<const std::byte>> keys) const
+std::vector<std::string> CDBWrapper::MultiReadImpl(Span<std::string> keys) const
 {
     std::vector<rocksdb::Slice> slices;
-    for (const auto& key : keys) slices.emplace_back(CharCast(key.data()), key.size());
+    for (const auto& key : keys) {
+        slices.emplace_back(key);
+    }
 
     std::vector<std::string> values;
     std::vector<rocksdb::Status> statuses = DBContext().pdb->MultiGet(DBContext().readoptions, slices, &values);

@@ -308,6 +308,7 @@ public:
      *  When false is returned, coin's value is unspecified.
      */
     virtual bool GetCoin(const COutPoint &outpoint, Coin &coin) const;
+    virtual std::vector<Coin> GetCoins(const Span<COutPoint>& outpoints) const;
 
     //! Just check whether a given outpoint is unspent.
     virtual bool HaveCoin(const COutPoint &outpoint) const;
@@ -345,6 +346,7 @@ protected:
 public:
     CCoinsViewBacked(CCoinsView *viewIn);
     bool GetCoin(const COutPoint &outpoint, Coin &coin) const override;
+    std::vector<Coin> GetCoins(const Span<COutPoint>& outpoints) const override;
     bool HaveCoin(const COutPoint &outpoint) const override;
     uint256 GetBestBlock() const override;
     std::vector<uint256> GetHeadBlocks() const override;
@@ -385,6 +387,7 @@ public:
 
     // Standard CCoinsView methods
     bool GetCoin(const COutPoint &outpoint, Coin &coin) const override;
+    std::vector<Coin> GetCoins(const Span<COutPoint>& outpoints) const override;
     bool HaveCoin(const COutPoint &outpoint) const override;
     uint256 GetBestBlock() const override;
     void SetBestBlock(const uint256 &hashBlock);
@@ -476,7 +479,12 @@ public:
     //! Run an internal sanity check on the cache data structure. */
     void SanityCheck() const;
 
+    bool HaveBlockInputs(const CBlock& block) const;
+    bool HaveOutputs(const CBlock& block) const;
+
 private:
+    bool HaveOutPoints(const Span<COutPoint> outpoints) const;
+
     /**
      * @note this is marked const, but may actually append to `cacheCoins`, increasing
      * memory usage.

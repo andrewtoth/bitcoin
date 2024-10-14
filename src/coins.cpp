@@ -9,7 +9,11 @@
 #include <random.h>
 #include <util/trace.h>
 
+#include <set>
+#include <vector>
+
 bool CCoinsView::GetCoin(const COutPoint &outpoint, Coin &coin) const { return false; }
+std::vector<Coin> CCoinsView::GetCoins(const Span<COutPoint>& outpoints) const { return {}; }
 uint256 CCoinsView::GetBestBlock() const { return uint256(); }
 std::vector<uint256> CCoinsView::GetHeadBlocks() const { return std::vector<uint256>(); }
 bool CCoinsView::BatchWrite(CoinsViewCacheCursor& cursor, const uint256 &hashBlock) { return false; }
@@ -23,6 +27,7 @@ bool CCoinsView::HaveCoin(const COutPoint &outpoint) const
 
 CCoinsViewBacked::CCoinsViewBacked(CCoinsView *viewIn) : base(viewIn) { }
 bool CCoinsViewBacked::GetCoin(const COutPoint &outpoint, Coin &coin) const { return base->GetCoin(outpoint, coin); }
+std::vector<Coin> CCoinsViewBacked::GetCoins(const Span<COutPoint>& outpoints) const { return base->GetCoins(outpoints); }
 bool CCoinsViewBacked::HaveCoin(const COutPoint &outpoint) const { return base->HaveCoin(outpoint); }
 uint256 CCoinsViewBacked::GetBestBlock() const { return base->GetBestBlock(); }
 std::vector<uint256> CCoinsViewBacked::GetHeadBlocks() const { return base->GetHeadBlocks(); }
@@ -65,6 +70,33 @@ bool CCoinsViewCache::GetCoin(const COutPoint &outpoint, Coin &coin) const {
         return !coin.IsSpent();
     }
     return false;
+}
+
+std::vector<Coin> CCoinsViewCache::GetCoins(const Span<COutPoint>& outpoints) const
+{
+    std::vector<Coin> result{};
+    result.reserve(outpoints.size());
+    std::vector<COutPoint> missing_outpoints{};
+    std::vector<size_t> missing_indexes{};
+    for (auto outpoint : outpoints) {
+        if (auto it = cacheCoins.find(outpoint); it == cacheCoins.end()) {
+            missing_outpoints.insert(missing_outpoints.begin(), outpoint);
+            missing_indexes.insert(missing_indexes.begin(), result.size());
+        } else if (!it->second.coin.IsSpent()) {
+            result.push_back(it->second.coin);
+        }
+    }
+
+    if (result.size() == outpoints.size()) return result;
+
+    auto fetched_coins = base->GetCoins(missing_outpoints);
+    for (size_t i = 0; i < missing_indexes.size(); ++i) {
+        if (fetched_coins.size() <= i) {
+            break;
+        } 
+        result.insert(result.begin() + missing_indexes[i], fetched_coins[i]);
+    }
+    return result;
 }
 
 void CCoinsViewCache::AddCoin(const COutPoint &outpoint, Coin&& coin, bool possible_overwrite) {
@@ -297,13 +329,68 @@ unsigned int CCoinsViewCache::GetCacheSize() const {
 bool CCoinsViewCache::HaveInputs(const CTransaction& tx) const
 {
     if (!tx.IsCoinBase()) {
-        for (unsigned int i = 0; i < tx.vin.size(); i++) {
-            if (!HaveCoin(tx.vin[i].prevout)) {
-                return false;
-            }
+        std::vector<COutPoint> outpoints;
+        outpoints.reserve(tx.vin.size());
+        for (const auto& in : tx.vin) {
+            outpoints.emplace_back(in.prevout);
+        }
+        return HaveOutPoints(outpoints);
+    }
+    return true;
+}
+
+bool CCoinsViewCache::HaveBlockInputs(const CBlock& block) const
+{
+    std::set<const Txid> txids{};
+    std::vector<COutPoint> inputs;
+    inputs.reserve(block.vtx.size());
+    for (auto tx : block.vtx) {
+        if (tx->IsCoinBase()) continue;
+        for (auto input : tx->vin) {
+            const COutPoint outpoint = input.prevout;
+            if (txids.contains(outpoint.hash)) continue;
+            inputs.emplace_back(outpoint);
+        }
+        txids.emplace(tx->GetHash());
+    }
+
+    return HaveOutPoints(inputs);
+}
+
+bool CCoinsViewCache::HaveOutPoints(const Span<COutPoint> outpoints) const
+{
+    if (outpoints.empty()) return true;
+
+    auto fetched_coins = GetCoins(outpoints);
+    if (fetched_coins.size() != outpoints.size()) {
+        return false;
+    }
+
+    for (size_t i = 0; i < outpoints.size(); ++i) {
+        auto [it, inserted] = cacheCoins.try_emplace(outpoints[i]);
+        Assume(inserted);
+        it->second.coin = std::move(fetched_coins[i]);
+        cachedCoinsUsage += it->second.coin.DynamicMemoryUsage();
+        if (it->second.coin.IsSpent()) {
+            it->second.AddFlags(CCoinsCacheEntry::FRESH, *it, m_sentinel);
+            return false;
         }
     }
     return true;
+}
+
+bool CCoinsViewCache::HaveOutputs(const CBlock& block) const
+{
+    std::vector<COutPoint> outpoints;
+    outpoints.reserve(2 * block.vtx.size());
+    for (const auto& tx : block.vtx) {
+        for (uint32_t o = 0; o < tx->vout.size(); o++) {
+            outpoints.emplace_back(tx->GetHash(), o);
+        }
+    }
+
+    auto coins = GetCoins(outpoints);
+    return !coins.empty();
 }
 
 void CCoinsViewCache::ReallocateCache()
