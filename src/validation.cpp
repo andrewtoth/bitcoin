@@ -400,6 +400,7 @@ static bool CheckInputsFromMempoolAndCache(const CTransaction& tx, TxValidationS
     AssertLockHeld(pool.cs);
 
     assert(!tx.IsCoinBase());
+    view.ReserveCacheEntries(tx.vin.size());
     for (const CTxIn& txin : tx.vin) {
         const Coin& coin = view.AccessCoin(txin.prevout);
 
@@ -851,6 +852,7 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
 
     const CCoinsViewCache& coins_cache = m_active_chainstate.CoinsTip();
     // do all inputs exist?
+    m_view.ReserveCacheEntries(tx.vin.size());
     for (const CTxIn& txin : tx.vin) {
         if (!coins_cache.HaveCoinInCache(txin.prevout)) {
             coins_to_uncache.push_back(txin.prevout);
@@ -2283,6 +2285,13 @@ DisconnectResult Chainstate::DisconnectBlock(const CBlock& block, const CBlockIn
     bool fEnforceBIP30 = !((pindex->nHeight==91722 && pindex->GetBlockHash() == uint256{"00000000000271a2dc26e7667f8419f2e15416dc6955e5a6c6cdf3f2574dd08e"}) ||
                            (pindex->nHeight==91812 && pindex->GetBlockHash() == uint256{"00000000000af0aed4792b1acee3d966af36cf5def14935db8de83d6f9306f2f"}));
 
+    size_t count{0};
+    for (const auto& tx : block.vtx) {
+        count += tx->vout.size();
+        count += tx->vin.size();
+    }
+    view.ReserveCacheEntries(count);
+
     // undo transactions in reverse order
     for (int i = block.vtx.size() - 1; i >= 0; i--) {
         const CTransaction &tx = *(block.vtx[i]);
@@ -2560,6 +2569,13 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     CBlockIndex* pindexBIP34height = pindex->pprev->GetAncestor(params.GetConsensus().BIP34Height);
     //Only continue to enforce if we're below BIP34 activation height or the block hash at that height doesn't correspond.
     fEnforceBIP30 = fEnforceBIP30 && (!pindexBIP34height || !(pindexBIP34height->GetBlockHash() == params.GetConsensus().BIP34Hash));
+
+    size_t count{0};
+    for (const auto& tx : block.vtx) {
+        count += tx->vout.size();
+        count += tx->vin.size();
+    }
+    view.ReserveCacheEntries(count);
 
     // TODO: Remove BIP30 checking from block height 1,983,702 on, once we have a
     // consensus change that ensures coinbases at those heights cannot
@@ -2921,6 +2937,14 @@ bool Chainstate::FlushStateToDisk(
                    (uint64_t)coins_mem_usage,
                    (bool)fFlushForPrune);
         }
+
+        // Reserve the buckets after a flush since either the cache will have been erased,
+        // or we could have more space in case the mempool cleared and should preallocate for it.
+        const auto total_space{GetCoinsCacheSizeTotalSpace(
+            m_coinstip_cache_size_bytes,
+            m_mempool ? m_mempool->m_opts.max_size_bytes : 0
+        )};
+        CoinsTip().ReserveCacheEntries(std::ceil(total_space / (sizeof(CoinsCachePair) + sizeof(void*))));
     }
     if (full_flush_completed && m_chainman.m_options.signals) {
         // Update best block in wallet (so we can detect restored wallets).
@@ -5871,6 +5895,7 @@ util::Result<void> ChainstateManager::PopulateAndValidateSnapshot(
 
     const uint64_t coins_count = metadata.m_coins_count;
     uint64_t coins_left = metadata.m_coins_count;
+    coins_cache.ReserveCacheEntries(coins_count);
 
     LogPrintf("[snapshot] loading %d coins from snapshot %s\n", coins_left, base_blockhash.ToString());
     int64_t coins_processed{0};

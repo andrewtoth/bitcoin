@@ -460,6 +460,9 @@ public:
     //! Calculate the size of the cache (in number of transaction outputs)
     unsigned int GetCacheSize() const;
 
+    //! Preallocate the cache map buckets if we know how many entries we will have
+    void ReserveCacheEntries(size_t count);
+
     //! Calculate the size of the cache (in bytes)
     size_t DynamicMemoryUsage() const;
 

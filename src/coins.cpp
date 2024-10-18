@@ -294,6 +294,16 @@ unsigned int CCoinsViewCache::GetCacheSize() const {
     return cacheCoins.size();
 }
 
+void CCoinsViewCache::ReserveCacheEntries(size_t count) {
+    // If count is greater than bucket_count * max_load_factor, this will increase
+    // the bucket count and rehash.
+    // If count is less, it should be a noop, but some implementations will try and
+    // shrink and rehash. So, avoid calling in that case.
+    if (count > cacheCoins.bucket_count() * cacheCoins.max_load_factor()) {
+        cacheCoins.reserve(count);
+    }
+}
+
 bool CCoinsViewCache::HaveInputs(const CTransaction& tx) const
 {
     if (!tx.IsCoinBase()) {
