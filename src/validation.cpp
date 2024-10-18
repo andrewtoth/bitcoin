@@ -2742,23 +2742,31 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     return true;
 }
 
-CoinsCacheSizeState Chainstate::GetCoinsCacheSizeState()
-{
-    AssertLockHeld(::cs_main);
-    return this->GetCoinsCacheSizeState(
-        m_coinstip_cache_size_bytes,
-        m_mempool ? m_mempool->m_opts.max_size_bytes : 0);
-}
-
-CoinsCacheSizeState Chainstate::GetCoinsCacheSizeState(
+size_t Chainstate::GetCoinsCacheSizeTotalSpace(
     size_t max_coins_cache_size_bytes,
     size_t max_mempool_size_bytes)
 {
     AssertLockHeld(::cs_main);
-    const int64_t nMempoolUsage = m_mempool ? m_mempool->DynamicMemoryUsage() : 0;
+    const int64_t mempool_usage = m_mempool ? m_mempool->DynamicMemoryUsage() : 0;
+    return max_coins_cache_size_bytes + std::max<int64_t>(int64_t(max_mempool_size_bytes) - mempool_usage, 0);
+}
+
+CoinsCacheSizeState Chainstate::GetCoinsCacheSizeState()
+{
+    AssertLockHeld(::cs_main);
+    const size_t total_space_bytes{GetCoinsCacheSizeTotalSpace(
+        m_coinstip_cache_size_bytes,
+        m_mempool ? m_mempool->m_opts.max_size_bytes : 0
+    )};
+    return GetCoinsCacheSizeState(total_space_bytes);
+}
+
+CoinsCacheSizeState Chainstate::GetCoinsCacheSizeState(
+    size_t total_space_bytes)
+{
+    AssertLockHeld(::cs_main);
     int64_t cacheSize = CoinsTip().DynamicMemoryUsage();
-    int64_t nTotalSpace =
-        max_coins_cache_size_bytes + std::max<int64_t>(int64_t(max_mempool_size_bytes) - nMempoolUsage, 0);
+    int64_t nTotalSpace = total_space_bytes;
 
     //! No need to periodic flush if at least this much space still available.
     static constexpr int64_t MAX_BLOCK_COINSDB_USAGE_BYTES = 10 * 1024 * 1024;  // 10MB
