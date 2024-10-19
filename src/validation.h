@@ -484,7 +484,9 @@ public:
 enum class CoinsCacheSizeState
 {
     //! The coins cache is in immediate need of a flush.
-    CRITICAL = 3,
+    CRITICAL = 4,
+    //! The coins cache is in immediate need of a flush.
+    NEAR_CRITICAL_FLUSH = 3,
     //! The coins cache is at >= 99% capacity.
     NEAR_CRITICAL = 2,
     //! The cache is at >= 90% capacity.

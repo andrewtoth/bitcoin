@@ -2767,16 +2767,20 @@ static size_t GetCoinsCacheSizeNearCriticalThreshold(size_t total_space_bytes)
         static_cast<int64_t>(total_space_bytes) - MAX_BLOCK_COINSDB_USAGE_BYTES);
 }
 
+static size_t largest_coins{0};
+
 CoinsCacheSizeState Chainstate::GetCoinsCacheSizeState(size_t total_space_bytes)
 {
     AssertLockHeld(::cs_main);
     const int64_t cache_size = CoinsTip().DynamicMemoryUsage();
-    const int64_t cache_size_minus_free_space = cache_size - CoinsTip().DynamicMemoryAvailableSpace();
+    const int64_t cache_size_minus_free_space = cache_size + static_cast<int64_t>(CoinsTip().CoinsMemoryUsage()) - CoinsTip().DynamicMemoryAvailableSpace();
 
     if (cache_size > static_cast<int64_t>(total_space_bytes)) {
         LogInfo("Cache size (%s) exceeds total space (%s)\n", cache_size, total_space_bytes);
+        assert(false);
         return CoinsCacheSizeState::CRITICAL;
     } else if (const int64_t threshold = GetCoinsCacheSizeNearCriticalThreshold(total_space_bytes); cache_size_minus_free_space > threshold) {
+        largest_coins = std::max(largest_coins, CoinsTip().CoinsMemoryUsage());
         LogInfo("Cache size (%s) exceeds near critical threshold (%s)\n", cache_size_minus_free_space, threshold);
         return CoinsCacheSizeState::NEAR_CRITICAL;
     } else if (cache_size_minus_free_space > static_cast<int64_t>(GetCoinsCacheSizeLargeThreshold(total_space_bytes))) {
@@ -2874,6 +2878,7 @@ bool Chainstate::FlushStateToDisk(
         bool fCacheLarge = mode == FlushStateMode::PERIODIC && cache_state >= CoinsCacheSizeState::LARGE;
         // The cache is large and we're within 1% and 4 MiB of the limit, we have to do a non-erasing sync now.
         bool cache_is_near_critical = mode == FlushStateMode::IF_NEEDED && cache_state >= CoinsCacheSizeState::NEAR_CRITICAL;
+        bool cache_is_near_critical_flush = mode == FlushStateMode::IF_NEEDED && cache_state >= CoinsCacheSizeState::NEAR_CRITICAL_FLUSH;
         // The cache is over the limit, we have to do an erasing write now.
         bool fCacheCritical = mode == FlushStateMode::IF_NEEDED && cache_state >= CoinsCacheSizeState::CRITICAL;
         // It's been a while since we wrote the block index to disk. Do this frequently, so we don't need to redownload after a crash.
@@ -2929,10 +2934,11 @@ bool Chainstate::FlushStateToDisk(
                 return FatalError(m_chainman.GetNotifications(), state, _("Disk space is too low!"));
             }
             // Flush the chainstate (which may refer to block index entries).
-            const auto empty_cache{(mode == FlushStateMode::ALWAYS) || fCacheCritical};
-            if (empty_cache ? !CoinsTip().Flush() : !CoinsTip().Sync()) {
+            const auto empty_cache{(mode == FlushStateMode::ALWAYS) || fCacheCritical || cache_is_near_critical_flush};
+            if (empty_cache ? !CoinsTip().Flush(fCacheCritical) : !CoinsTip().Sync()) {
                 return FatalError(m_chainman.GetNotifications(), state, _("Failed to write to coin database."));
             }
+            LogPrintf("Largest coins size %d\n", largest_coins);
             m_last_flush = nNow;
             full_flush_completed = true;
             TRACE5(utxocache, flush,
@@ -2986,7 +2992,7 @@ static void UpdateTipLog(
         log(tip->nChainWork.getdouble()) / log(2.0), tip->m_chain_tx_count,
         FormatISO8601DateTime(tip->GetBlockTime()),
         GuessVerificationProgress(params.TxData(), tip),
-        (coins_tip.DynamicMemoryUsage() - coins_tip.DynamicMemoryAvailableSpace()) * (1.0 / (1 << 20)),
+        (coins_tip.DynamicMemoryUsage() + coins_tip.CoinsMemoryUsage() - coins_tip.DynamicMemoryAvailableSpace()) * (1.0 / (1 << 20)),
         coins_tip.GetCacheSize(),
         !warning_messages.empty() ? strprintf(" warning='%s'", warning_messages) : "");
 }

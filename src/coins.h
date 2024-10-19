@@ -456,7 +456,7 @@ public:
      * to be forgotten.
      * If false is returned, the state of this cache (and its backing view) will be undefined.
      */
-    bool Flush();
+    bool Flush(bool reallocate = true);
 
     /**
      * Push the modifications applied to this cache to its base while retaining
@@ -484,6 +484,8 @@ public:
 
     //! Calculate the total size of the cache in memory (in bytes)
     size_t DynamicMemoryUsage() const;
+
+    size_t CoinsMemoryUsage() const;
 
     //! Calculate the size of the available space in the cache (in bytes)
     size_t DynamicMemoryAvailableSpace() const;

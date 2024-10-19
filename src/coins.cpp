@@ -40,8 +40,14 @@ CCoinsViewCache::CCoinsViewCache(CCoinsView* baseIn, bool deterministic) :
 }
 
 size_t CCoinsViewCache::DynamicMemoryUsage() const {
-    return memusage::DynamicUsage(cacheCoins) + cachedCoinsUsage;
+    return memusage::DynamicUsage(cacheCoins);
 }
+
+
+size_t CCoinsViewCache::CoinsMemoryUsage() const {
+    return cachedCoinsUsage;   
+}
+
 
 size_t CCoinsViewCache::DynamicMemoryAvailableSpace() const {
     return cacheCoins.get_allocator().resource()->FreeListBytes();
@@ -258,12 +264,14 @@ bool CCoinsViewCache::BatchWrite(CoinsViewCacheCursor& cursor, const uint256 &ha
     return true;
 }
 
-bool CCoinsViewCache::Flush() {
+bool CCoinsViewCache::Flush(bool reallocate) {
     auto cursor{CoinsViewCacheCursor(cachedCoinsUsage, m_sentinel, m_clean_sentinel, cacheCoins, /*will_erase=*/true)};
     bool fOk = base->BatchWrite(cursor, hashBlock);
     if (fOk) {
         cacheCoins.clear();
-        ReallocateCache();
+        if (reallocate) {
+            ReallocateCache();
+        }
     }
     cachedCoinsUsage = 0;
     return fOk;
@@ -285,7 +293,7 @@ bool CCoinsViewCache::Sync()
 void CCoinsViewCache::MaybeShrinkCache(size_t size_to_fit) noexcept
 {
     auto it{m_clean_sentinel.second.Next()};
-    while (it != &m_clean_sentinel && static_cast<int64_t>(DynamicMemoryUsage()) - DynamicMemoryAvailableSpace() >= size_to_fit) {
+    while (it != &m_clean_sentinel && static_cast<int64_t>(DynamicMemoryUsage() + CoinsMemoryUsage()) - DynamicMemoryAvailableSpace() >= size_to_fit) {
         auto next{it->second.Next()};
         cachedCoinsUsage -= it->second.coin.DynamicMemoryUsage();
         cacheCoins.erase(it->first);
