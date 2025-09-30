@@ -6,14 +6,15 @@
 #define BITCOIN_INPUTFETCHER_H
 
 #include <coins.h>
+#include <logging.h>
 #include <primitives/transaction_identifier.h>
 #include <sync.h>
 #include <tinyformat.h>
 #include <txdb.h>
 #include <util/hasher.h>
 #include <util/threadnames.h>
+#include <util/time.h>
 
-#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 #include <thread>
@@ -42,13 +43,6 @@ private:
     std::condition_variable m_main_cv{};
 
     /**
-     * The outpoints to be fetched from disk.
-     * This is written to on the main thread, then read from all worker
-     * threads only after the main thread is done writing. Hence, it doesn't
-     * need to be guarded by a lock.
-     */
-    std::vector<std::pair<size_t, size_t>> m_outpoints{};
-    /**
      * The index of the last outpoint that is being fetched. Workers assign
      * themselves a range of outpoints to fetch from m_outpoints. They will use
      * this index as the end of their range, and then set this index to the
@@ -58,9 +52,9 @@ private:
     size_t m_last_outpoint_index GUARDED_BY(m_mutex){0};
 
     //! The set of txids of the transactions in the current block being fetched.
-    std::vector<Txid> m_txids{};
+    std::unordered_set<Txid, SaltedTxidHasher> m_txids{};
     //! The vector of thread local vectors of pairs to be written to the cache.
-    std::vector<std::vector<std::pair<size_t, Coin>>> m_pairs{};
+    std::vector<std::vector<std::pair<COutPoint, Coin>>> m_pairs{};
 
     /**
      * Number of outpoint fetches that haven't completed yet.
@@ -122,27 +116,30 @@ private:
             local_pairs.reserve(local_pairs.size() + local_batch_size);
             try {
                 for (auto i{end_index - local_batch_size}; i < end_index; ++i) {
-                    const auto [tx_index, input_index] = m_outpoints[i];
-                    const auto& outpoint{m_block->vtx[tx_index]->vin[input_index].prevout};
-                    // If an input spends an outpoint from earlier in the
-                    // block, it won't be in the cache yet but it also won't be
-                    // in the db either.
-                    if (std::binary_search(m_txids.begin(), m_txids.end(), outpoint.hash)) {
-                        continue;
-                    }
-                    if (m_cache->HaveCoinInCache(outpoint)) {
-                        continue;
-                    }
-                    if (auto coin{m_db->GetCoin(outpoint)}; coin) {
-                        local_pairs.emplace_back(i, std::move(*coin));
-                    } else {
-                        // Missing an input. This block will fail validation.
-                        // Skip remaining outpoints and continue so main thread
-                        // can proceed.
-                        LOCK(m_mutex);
-                        m_in_flight_outpoints_count -= m_last_outpoint_index;
-                        m_last_outpoint_index = 0;
-                        break;
+                    const auto& tx{m_block->vtx[i]};
+                    for (size_t j{0}; j < tx->vin.size(); ++j) {
+                        const auto& outpoint{tx->vin[j].prevout};
+                        // If an input spends an outpoint from earlier in the
+                        // block, it won't be in the cache yet but it also won't be
+                        // in the db either.
+                        if (m_txids.contains(outpoint.hash)) {
+                            continue;
+                        }
+                        if (m_cache->HaveCoinInCache(outpoint)) {
+                            continue;
+                        }
+                        if (auto coin{m_db->GetCoin(outpoint)}; coin) {
+                            local_pairs.emplace_back(outpoint, std::move(*coin));
+                        } else {
+                            // Missing an input. This block will fail validation.
+                            // Skip remaining outpoints and continue so main thread
+                            // can proceed.
+                            LOCK(m_mutex);
+                            m_in_flight_outpoints_count -= m_last_outpoint_index;
+                            m_last_outpoint_index = 0;
+                            i = end_index;
+                            break;
+                        }
                     }
                 }
             } catch (const std::runtime_error&) {
@@ -201,50 +198,53 @@ public:
         m_cache = &cache;
         m_block = &block;
 
+        // Timing variables for debug bench logs
+        const auto time_start{SteadyClock::now()};
         // Loop through the inputs of the block and add them to the queue
+        const auto time_build_vectors_start{SteadyClock::now()};
         m_txids.reserve(block.vtx.size() - 1);
         for (size_t i{1}; i < block.vtx.size(); ++i) {
             const auto& tx = block.vtx[i];
-            m_outpoints.reserve(m_outpoints.size() + tx->vin.size());
-            for (size_t j{0}; j < tx->vin.size(); ++j) {
-                m_outpoints.emplace_back(i, j);
-            }
-            m_txids.emplace_back(tx->GetHash());
+            m_txids.emplace(tx->GetHash());
         }
-
-        // if (m_outpoints.size() < 128) {
-        //     m_txids.clear();
-        //     m_outpoints.clear();
-        //     return;
-        // }
-
-        std::sort(m_txids.begin(), m_txids.end());
-
+        const auto time_build_vectors_end{SteadyClock::now()};
+        LogDebug(BCLog::BENCH, "    - Build m_txids and m_outpoints vectors: %.2fms\n",
+                 Ticks<MillisecondsDouble>(time_build_vectors_end - time_build_vectors_start));
 
         {
             LOCK(m_mutex);
-            m_in_flight_outpoints_count = m_outpoints.size();
-            m_last_outpoint_index = m_outpoints.size();
+            m_in_flight_outpoints_count = m_txids.size();
+            m_last_outpoint_index = m_txids.size();
         }
         m_worker_cv.notify_all();
 
         // Have the main thread work too while we wait for other threads
+        const auto time_loop_start{SteadyClock::now()};
         Loop(m_worker_threads.size(), /*is_main_thread=*/true);
+        const auto time_loop_end{SteadyClock::now()};
+        LogDebug(BCLog::BENCH, "    - Perform Loop operation: %.2fms\n",
+                 Ticks<MillisecondsDouble>(time_loop_end - time_loop_start));
 
         // At this point all threads are done writing to m_pairs, so we can
         // safely read from it and insert the fetched coins into the cache.
+        const auto time_cache_insert_start{SteadyClock::now()};
         for (auto& local_pairs : m_pairs) {
-            for (auto&& [index, coin] : local_pairs) {
-                const auto [tx_index, input_index] = m_outpoints[index];
-                COutPoint outpoint{block.vtx[tx_index]->vin[input_index].prevout};
+            for (auto&& [outpoint, coin] : local_pairs) {
                 cache.EmplaceCoinInternalDANGER(std::move(outpoint),
                                                 std::move(coin),
                                                 /*set_dirty=*/false);
             }
             local_pairs.clear();
         }
+        const auto time_cache_insert_end{SteadyClock::now()};
+        LogDebug(BCLog::BENCH, "    - Insert m_pairs into cache: %.2fms\n",
+                 Ticks<MillisecondsDouble>(time_cache_insert_end - time_cache_insert_start));
+        
+        const auto time_end{SteadyClock::now()};
+        LogDebug(BCLog::BENCH, "  - FetchInputs total: %.2fms\n",
+                 Ticks<MillisecondsDouble>(time_end - time_start));
+        
         m_txids.clear();
-        m_outpoints.clear();
     }
 
     ~InputFetcher()
