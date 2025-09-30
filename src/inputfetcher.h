@@ -13,6 +13,7 @@
 #include <util/hasher.h>
 #include <util/threadnames.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 #include <thread>
@@ -46,7 +47,7 @@ private:
      * threads only after the main thread is done writing. Hence, it doesn't
      * need to be guarded by a lock.
      */
-    std::vector<COutPoint> m_outpoints{};
+    std::vector<std::pair<size_t, size_t>> m_outpoints{};
     /**
      * The index of the last outpoint that is being fetched. Workers assign
      * themselves a range of outpoints to fetch from m_outpoints. They will use
@@ -57,9 +58,9 @@ private:
     size_t m_last_outpoint_index GUARDED_BY(m_mutex){0};
 
     //! The set of txids of the transactions in the current block being fetched.
-    std::unordered_set<Txid, SaltedTxidHasher> m_txids{};
+    std::vector<Txid> m_txids{};
     //! The vector of thread local vectors of pairs to be written to the cache.
-    std::vector<std::vector<std::pair<COutPoint, Coin>>> m_pairs{};
+    std::vector<std::vector<std::pair<size_t, Coin>>> m_pairs{};
 
     /**
      * Number of outpoint fetches that haven't completed yet.
@@ -75,6 +76,7 @@ private:
     const CCoinsView* m_db{nullptr};
     //! The cache to check if we already have this input.
     const CCoinsViewCache* m_cache{nullptr};
+    const CBlock* m_block{nullptr};
 
     std::vector<std::thread> m_worker_threads;
     bool m_request_stop GUARDED_BY(m_mutex){false};
@@ -82,8 +84,8 @@ private:
     //! Internal function that does the fetching from disk.
     void Loop(int32_t index, bool is_main_thread = false) noexcept EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)
     {
-        auto local_batch_size{0};
-        auto end_index{0};
+        size_t local_batch_size{0};
+        size_t end_index{0};
         auto& cond{is_main_thread ? m_main_cv : m_worker_cv};
         do {
             {
@@ -109,9 +111,7 @@ private:
                 }
 
                 // Assign a batch of outpoints to this thread
-                local_batch_size = std::max(1, std::min(m_batch_size,
-                            static_cast<int32_t>(m_last_outpoint_index /
-                            (m_worker_threads.size() + 1 + m_idle_worker_count))));
+                local_batch_size = std::max<size_t>(1, std::min(m_last_outpoint_index, m_outpoints.size() / m_worker_threads.size() + 1));
                 end_index = m_last_outpoint_index;
                 m_last_outpoint_index -= local_batch_size;
             }
@@ -119,19 +119,20 @@ private:
             auto& local_pairs{m_pairs[index]};
             local_pairs.reserve(local_pairs.size() + local_batch_size);
             try {
-                for (auto i{end_index - local_batch_size}; i < end_index; ++i) {
-                    const auto& outpoint{m_outpoints[i]};
+                for (size_t i{end_index - local_batch_size}; i < end_index; ++i) {
+                    const auto [tx_index, input_index] = m_outpoints[i];
+                    const auto& outpoint{m_block->vtx[tx_index]->vin[input_index].prevout};
                     // If an input spends an outpoint from earlier in the
                     // block, it won't be in the cache yet but it also won't be
                     // in the db either.
-                    if (m_txids.contains(outpoint.hash)) {
+                    if (std::binary_search(m_txids.begin(), m_txids.end(), outpoint.hash)) {
                         continue;
                     }
                     if (m_cache->HaveCoinInCache(outpoint)) {
                         continue;
                     }
                     if (auto coin{m_db->GetCoin(outpoint)}; coin) {
-                        local_pairs.emplace_back(outpoint, std::move(*coin));
+                        local_pairs.emplace_back(i, std::move(*coin));
                     } else {
                         // Missing an input. This block will fail validation.
                         // Skip remaining outpoints and continue so main thread
@@ -196,19 +197,28 @@ public:
         // Set the db and cache to use for this block.
         m_db = &db;
         m_cache = &cache;
+        m_block = &block;
 
         // Loop through the inputs of the block and add them to the queue
         m_txids.reserve(block.vtx.size() - 1);
-        for (const auto& tx : block.vtx) {
-            if (tx->IsCoinBase()) {
-                continue;
-            }
+        for (size_t i{1}; i < block.vtx.size(); ++i) {
+            const auto& tx = block.vtx[i];
             m_outpoints.reserve(m_outpoints.size() + tx->vin.size());
-            for (const auto& in : tx->vin) {
-                m_outpoints.emplace_back(in.prevout);
+            for (size_t j{0}; j < tx->vin.size(); ++j) {
+                m_outpoints.emplace_back(i, j);
             }
-            m_txids.emplace(tx->GetHash());
+            m_txids.emplace_back(tx->GetHash());
         }
+
+        // if (m_outpoints.size() < 128) {
+        //     m_txids.clear();
+        //     m_outpoints.clear();
+        //     return;
+        // }
+
+        std::sort(m_txids.begin(), m_txids.end());
+
+
         {
             LOCK(m_mutex);
             m_in_flight_outpoints_count = m_outpoints.size();
@@ -222,7 +232,9 @@ public:
         // At this point all threads are done writing to m_pairs, so we can
         // safely read from it and insert the fetched coins into the cache.
         for (auto& local_pairs : m_pairs) {
-            for (auto&& [outpoint, coin] : local_pairs) {
+            for (auto&& [index, coin] : local_pairs) {
+                const auto [tx_index, input_index] = m_outpoints[index];
+                COutPoint outpoint{block.vtx[tx_index]->vin[input_index].prevout};
                 cache.EmplaceCoinInternalDANGER(std::move(outpoint),
                                                 std::move(coin),
                                                 /*set_dirty=*/false);
