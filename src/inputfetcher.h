@@ -84,8 +84,8 @@ private:
     //! Internal function that does the fetching from disk.
     void Loop(int32_t index, bool is_main_thread = false) noexcept EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)
     {
-        size_t local_batch_size{0};
-        size_t end_index{0};
+        auto local_batch_size{0};
+        auto end_index{0};
         auto& cond{is_main_thread ? m_main_cv : m_worker_cv};
         do {
             {
@@ -111,7 +111,9 @@ private:
                 }
 
                 // Assign a batch of outpoints to this thread
-                local_batch_size = std::max<size_t>(1, std::min(m_last_outpoint_index, m_outpoints.size() / m_worker_threads.size() + 1));
+                local_batch_size = std::max(1, std::min(m_batch_size,
+                            static_cast<int32_t>(m_last_outpoint_index /
+                            (m_worker_threads.size() + 1 + m_idle_worker_count))));
                 end_index = m_last_outpoint_index;
                 m_last_outpoint_index -= local_batch_size;
             }
@@ -119,7 +121,7 @@ private:
             auto& local_pairs{m_pairs[index]};
             local_pairs.reserve(local_pairs.size() + local_batch_size);
             try {
-                for (size_t i{end_index - local_batch_size}; i < end_index; ++i) {
+                for (auto i{end_index - local_batch_size}; i < end_index; ++i) {
                     const auto [tx_index, input_index] = m_outpoints[i];
                     const auto& outpoint{m_block->vtx[tx_index]->vin[input_index].prevout};
                     // If an input spends an outpoint from earlier in the
