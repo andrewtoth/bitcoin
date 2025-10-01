@@ -86,8 +86,13 @@ private:
                     }
                     if (!is_main_thread) {
                         const auto idle_worker_count{m_idle_worker_count.fetch_add(1, std::memory_order_relaxed)};
-                        if (m_idle_worker_count == m_worker_threads.size() - 1) {
+                        if (idle_worker_count == m_worker_threads.size() - 1) {
                             m_main_cv.notify_one();
+                        }
+                    } else {
+                        const auto idle_worker_count{m_idle_worker_count.load(std::memory_order_relaxed)};
+                        if (idle_worker_count == m_worker_threads.size()) {
+                            return;
                         }
                     }
                     cond.wait(lock);
@@ -98,7 +103,7 @@ private:
                 if (is_main_thread) {
                     return;
                 } else {
-                    m_idle_worker_count.fetch_sub(1, std::memory_order_relaxed)
+                    m_idle_worker_count.fetch_sub(1, std::memory_order_relaxed);
                 }
                 start = m_last_tx_index.fetch_sub(m_batch_size, std::memory_order_relaxed);
             }
