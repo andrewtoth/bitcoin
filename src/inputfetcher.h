@@ -49,23 +49,17 @@ private:
      * beginning of the range they take for the next worker. Once it gets to
      * zero, all outpoints have been assigned and the next worker will wait.
      */
-    size_t m_last_outpoint_index GUARDED_BY(m_mutex){0};
+    std::atomic<int64_t> m_last_tx_index{0};
 
     //! The set of txids of the transactions in the current block being fetched.
     std::unordered_set<Txid, SaltedTxidHasher> m_txids{};
     //! The vector of thread local vectors of pairs to be written to the cache.
     std::vector<std::vector<std::pair<COutPoint, Coin>>> m_pairs{};
 
-    /**
-     * Number of outpoint fetches that haven't completed yet.
-     * This includes outpoints that have already been assigned, but are still in
-     * the worker's own batches.
-     */
-    int32_t m_in_flight_outpoints_count GUARDED_BY(m_mutex){0};
     //! The number of worker threads that are waiting on m_worker_cv
-    int32_t m_idle_worker_count GUARDED_BY(m_mutex){0};
+    size_t m_idle_worker_count GUARDED_BY(m_mutex){0};
     //! The maximum number of outpoints to be assigned in one batch
-    const int32_t m_batch_size;
+    const size_t m_batch_size;
     //! DB coins view to fetch from.
     const CCoinsView* m_db{nullptr};
     //! The cache to check if we already have this input.
@@ -78,44 +72,29 @@ private:
     //! Internal function that does the fetching from disk.
     void Loop(int32_t index, bool is_main_thread = false) noexcept EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)
     {
-        auto local_batch_size{0};
-        auto end_index{0};
         auto& cond{is_main_thread ? m_main_cv : m_worker_cv};
         do {
-            {
+            auto start{m_last_tx_index.fetch_sub(m_batch_size, std::memory_order_acquire)};
+            while (start <= 1) {
                 WAIT_LOCK(m_mutex, lock);
-                // first do the clean-up of the previous loop run (allowing us to do
-                // it in the same critsect) local_batch_size will only be
-                // truthy after first run.
-                if (local_batch_size) {
-                    m_in_flight_outpoints_count -= local_batch_size;
-                    if (!is_main_thread && m_in_flight_outpoints_count == 0) {
-                        m_main_cv.notify_one();
-                    }
+                if ((is_main_thread && m_idle_worker_count == m_worker_threads.size()) || m_request_stop) {
+                    return;
                 }
-
-                // logically, the do loop starts here
-                while (m_last_outpoint_index == 0) {
-                    if ((is_main_thread && m_in_flight_outpoints_count == 0) || m_request_stop) {
-                        return;
-                    }
-                    ++m_idle_worker_count;
-                    cond.wait(lock);
-                    --m_idle_worker_count;
+                ++m_idle_worker_count;
+                if (!is_main_thread && m_idle_worker_count == m_worker_threads.size() + 1) {
+                    m_main_cv.notify_one();
                 }
-
-                // Assign a batch of outpoints to this thread
-                local_batch_size = std::max(1, std::min(m_batch_size,
-                            static_cast<int32_t>(m_last_outpoint_index /
-                            (m_worker_threads.size() + 1 + m_idle_worker_count))));
-                end_index = m_last_outpoint_index;
-                m_last_outpoint_index -= local_batch_size;
+                cond.wait(lock);
+                --m_idle_worker_count;
+                if (is_main_thread || m_request_stop) {
+                    return;
+                }
+                start = m_last_tx_index.fetch_sub(m_batch_size, std::memory_order_acquire);
             }
 
             auto& local_pairs{m_pairs[index]};
-            local_pairs.reserve(local_pairs.size() + local_batch_size);
             try {
-                for (auto i{end_index - local_batch_size}; i < end_index; ++i) {
+                for (auto i{start - 1}; i >= std::max<int64_t>(start - m_batch_size, 1); --i) {
                     const auto& tx{m_block->vtx[i]};
                     for (size_t j{0}; j < tx->vin.size(); ++j) {
                         const auto& outpoint{tx->vin[j].prevout};
@@ -134,10 +113,8 @@ private:
                             // Missing an input. This block will fail validation.
                             // Skip remaining outpoints and continue so main thread
                             // can proceed.
-                            LOCK(m_mutex);
-                            m_in_flight_outpoints_count -= m_last_outpoint_index;
-                            m_last_outpoint_index = 0;
-                            i = end_index;
+                            m_last_tx_index.store(0, std::memory_order_relaxed);
+                            i = 0;
                             break;
                         }
                     }
@@ -146,9 +123,7 @@ private:
                 // Database error. This will be handled later in validation.
                 // Skip remaining outpoints and continue so main thread
                 // can proceed.
-                LOCK(m_mutex);
-                m_in_flight_outpoints_count -= m_last_outpoint_index;
-                m_last_outpoint_index = 0;
+                m_last_tx_index.store(0, std::memory_order_relaxed);
             }
         } while (true);
     }
@@ -189,7 +164,7 @@ public:
                      const CBlock& block) noexcept
         EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)
     {
-        if (m_worker_threads.empty() || block.vtx.size() <= 1) {
+        if (m_worker_threads.empty() || block.vtx.size() <= m_batch_size) {
             return;
         }
 
@@ -211,11 +186,7 @@ public:
         LogDebug(BCLog::BENCH, "    - Build m_txids and m_outpoints vectors: %.2fms\n",
                  Ticks<MillisecondsDouble>(time_build_vectors_end - time_build_vectors_start));
 
-        {
-            LOCK(m_mutex);
-            m_in_flight_outpoints_count = m_txids.size();
-            m_last_outpoint_index = m_txids.size();
-        }
+        m_last_tx_index.store(block.vtx.size(), std::memory_order_release);
         m_worker_cv.notify_all();
 
         // Have the main thread work too while we wait for other threads
