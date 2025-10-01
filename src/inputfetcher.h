@@ -72,9 +72,7 @@ private:
             // Try to acquire work from the semaphore
             if (!is_main_thread) {
                 m_work_semaphore.acquire();
-            
                 if (m_request_stop.load(std::memory_order_relaxed)) {
-                    m_complete_semaphore.release();
                     return;
                 }
             }
