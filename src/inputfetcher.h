@@ -8,7 +8,6 @@
 #include <coins.h>
 #include <logging.h>
 #include <primitives/transaction_identifier.h>
-#include <sync.h>
 #include <tinyformat.h>
 #include <txdb.h>
 #include <util/hasher.h>
@@ -16,6 +15,7 @@
 #include <util/time.h>
 
 #include <cstdint>
+#include <semaphore>
 #include <stdexcept>
 #include <thread>
 #include <unordered_set>
@@ -35,12 +35,10 @@
 class InputFetcher
 {
 private:
-    //! Mutex to protect the inner state
-    Mutex m_mutex{};
-    //! Worker threads block on this when out of work
-    std::condition_variable m_worker_cv{};
-    //! Main thread blocks on this when out of work
-    std::condition_variable m_main_cv{};
+    //! Counting semaphore to coordinate work between threads
+    std::counting_semaphore<> m_work_semaphore{0};
+    std::counting_semaphore<> m_complete_semaphore{0};
+    std::vector<std::pair<size_t, size_t>> m_outpoints{};
 
     /**
      * The index of the last outpoint that is being fetched. Workers assign
@@ -56,8 +54,6 @@ private:
     //! The vector of thread local vectors of pairs to be written to the cache.
     std::vector<std::vector<std::pair<COutPoint, Coin>>> m_pairs{};
 
-    //! The number of worker threads that are waiting on m_worker_cv
-    size_t m_idle_worker_count GUARDED_BY(m_mutex){0};
     //! The maximum number of outpoints to be assigned in one batch
     const size_t m_batch_size;
     //! DB coins view to fetch from.
@@ -67,51 +63,40 @@ private:
     const CBlock* m_block{nullptr};
 
     std::vector<std::thread> m_worker_threads;
-    bool m_request_stop GUARDED_BY(m_mutex){false};
+    std::atomic<bool> m_request_stop{false};
 
     //! Internal function that does the fetching from disk.
-    void Loop(int32_t index, bool is_main_thread = false) noexcept EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)
+    void Loop(int32_t index, bool is_main_thread = false) noexcept
     {
-        auto& cond{is_main_thread ? m_main_cv : m_worker_cv};
         do {
-            auto start{m_last_tx_index.fetch_sub(m_batch_size, std::memory_order_relaxed)};
-            while (start <= 1) {
-                {
-                    WAIT_LOCK(m_mutex, lock);
-                    if (m_request_stop) {
-                        return;
-                    }
-                    if (!is_main_thread) {
-                        ++m_idle_worker_count;
-                    }
-                    if (m_idle_worker_count == m_worker_threads.size()) {
-                        if (is_main_thread) {
-                            return;
-                        } else {
-                            m_main_cv.notify_one();
-                        }
-                    }
-                    cond.wait(lock);
-                    if (m_request_stop) {
-                        return;
-                    }
-                    if (!is_main_thread) {
-                        --m_idle_worker_count;
-                    } else if (m_idle_worker_count == m_worker_threads.size()) {
-                        return;
-                    }
-                }
-                if (!is_main_thread) {
-                    start = m_last_tx_index.fetch_sub(m_batch_size, std::memory_order_relaxed);
+            // Try to acquire work from the semaphore
+            if (!is_main_thread) {
+                m_work_semaphore.acquire();
+            
+                if (m_request_stop.load(std::memory_order_relaxed)) {
+                    m_complete_semaphore.release();
+                    return;
                 }
             }
+            
+            while (true) {
+                const auto start{m_last_tx_index.fetch_sub(m_batch_size, std::memory_order_relaxed)};
+                if (start <= 0) {
+                    // No more work available
+                    if (is_main_thread) {
+                        return;
+                    } else {
+                        // Worker thread is done, signal completion
+                        m_complete_semaphore.release();
+                        break;
+                    }
+                }
 
-            auto& local_pairs{m_pairs[index]};
-            try {
-                for (auto i{start - 1}; i >= std::max<int64_t>(start - m_batch_size, 1); --i) {
-                    const auto& tx{m_block->vtx[i]};
-                    for (size_t j{0}; j < tx->vin.size(); ++j) {
-                        const auto& outpoint{tx->vin[j].prevout};
+                auto& local_pairs{m_pairs[index]};
+                try {
+                    for (auto i{start - 1}; i >= std::max<int64_t>(start - m_batch_size, 0); --i) {
+                        const auto [tx_index, vin_index] = m_outpoints[i];
+                        const auto& outpoint{m_block->vtx[tx_index]->vin[vin_index].prevout};
                         // If an input spends an outpoint from earlier in the
                         // block, it won't be in the cache yet but it also won't be
                         // in the db either.
@@ -128,16 +113,15 @@ private:
                             // Skip remaining outpoints and continue so main thread
                             // can proceed.
                             m_last_tx_index.store(0, std::memory_order_relaxed);
-                            i = 0;
                             break;
                         }
                     }
+                } catch (const std::runtime_error&) {
+                    // Database error. This will be handled later in validation.
+                    // Skip remaining outpoints and continue so main thread
+                    // can proceed.
+                    m_last_tx_index.store(0, std::memory_order_relaxed);
                 }
-            } catch (const std::runtime_error&) {
-                // Database error. This will be handled later in validation.
-                // Skip remaining outpoints and continue so main thread
-                // can proceed.
-                m_last_tx_index.store(0, std::memory_order_relaxed);
             }
         } while (true);
     }
@@ -176,7 +160,6 @@ public:
     void FetchInputs(CCoinsViewCache& cache,
                      const CCoinsView& db,
                      const CBlock& block) noexcept
-        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)
     {
         if (m_worker_threads.empty() || block.vtx.size() <= m_batch_size) {
             return;
@@ -194,21 +177,34 @@ public:
         m_txids.reserve(block.vtx.size() - 1);
         for (size_t i{1}; i < block.vtx.size(); ++i) {
             const auto& tx = block.vtx[i];
+            for (size_t j{0}; j < tx->vin.size(); ++j) {
+                m_outpoints.emplace_back(i, j);
+            }
             m_txids.emplace(tx->GetHash());
         }
         const auto time_build_vectors_end{SteadyClock::now()};
         LogDebug(BCLog::BENCH, "    - Build m_txids and m_outpoints vectors: %.2fms\n",
                  Ticks<MillisecondsDouble>(time_build_vectors_end - time_build_vectors_start));
 
-        {
-            LOCK(m_mutex);
-            m_last_tx_index.store(block.vtx.size(), std::memory_order_relaxed);
+        // Initialize work counter and completion tracking
+        m_last_tx_index.store(m_outpoints.size(), std::memory_order_relaxed);
+        
+        // Signal all worker threads that work is available
+        // We need to signal enough times for all worker threads + main thread
+        const size_t total_threads = m_worker_threads.size();
+        for (size_t i = 0; i < total_threads; ++i) {
+            m_work_semaphore.release();
         }
-        m_worker_cv.notify_all();
 
         // Have the main thread work too while we wait for other threads
         const auto time_loop_start{SteadyClock::now()};
         Loop(m_worker_threads.size(), /*is_main_thread=*/true);
+        
+        // Wait for all worker threads to complete
+        for (size_t i = 0; i < total_threads; ++i) {
+            m_complete_semaphore.acquire();
+        }
+        
         const auto time_loop_end{SteadyClock::now()};
         LogDebug(BCLog::BENCH, "    - Perform Loop operation: %.2fms\n",
                  Ticks<MillisecondsDouble>(time_loop_end - time_loop_start));
@@ -233,12 +229,20 @@ public:
                  Ticks<MillisecondsDouble>(time_end - time_start));
         
         m_txids.clear();
+        m_outpoints.clear();
     }
 
     ~InputFetcher()
     {
-        WITH_LOCK(m_mutex, m_request_stop = true);
-        m_worker_cv.notify_all();
+        // Signal all threads to stop
+        m_request_stop.store(true, std::memory_order_relaxed);
+        
+        // Signal all worker threads to wake up and check the stop flag
+        const size_t total_threads = m_worker_threads.size();
+        for (size_t i = 0; i < total_threads; ++i) {
+            m_work_semaphore.release();
+        }
+        
         for (std::thread& t : m_worker_threads) {
             t.join();
         }
