@@ -57,7 +57,7 @@ private:
     std::vector<std::vector<std::pair<COutPoint, Coin>>> m_pairs{};
 
     //! The number of worker threads that are waiting on m_worker_cv
-    std::atomic<size_t> m_idle_worker_count{0};
+    size_t m_idle_worker_count GUARDED_BY(m_mutex){0};
     //! The maximum number of outpoints to be assigned in one batch
     const size_t m_batch_size;
     //! DB coins view to fetch from.
@@ -76,36 +76,34 @@ private:
         do {
             auto start{m_last_tx_index.fetch_sub(m_batch_size, std::memory_order_relaxed)};
             while (start <= 1) {
-                if (is_main_thread && m_idle_worker_count.load(std::memory_order_relaxed) == m_worker_threads.size()) {
-                    return;
-                }
                 {
                     WAIT_LOCK(m_mutex, lock);
                     if (m_request_stop) {
                         return;
                     }
                     if (!is_main_thread) {
-                        const auto idle_worker_count{m_idle_worker_count.fetch_add(1, std::memory_order_relaxed)};
-                        if (idle_worker_count == m_worker_threads.size() - 1) {
-                            m_main_cv.notify_one();
-                        }
-                    } else {
-                        const auto idle_worker_count{m_idle_worker_count.load(std::memory_order_relaxed)};
-                        if (idle_worker_count == m_worker_threads.size()) {
+                        ++m_idle_worker_count;
+                    }
+                    if (m_idle_worker_count == m_worker_threads.size()) {
+                        if (is_main_thread) {
                             return;
+                        } else {
+                            m_main_cv.notify_one();
                         }
                     }
                     cond.wait(lock);
                     if (m_request_stop) {
                         return;
                     }
+                    if (!is_main_thread) {
+                        --m_idle_worker_count;
+                    } else if (m_idle_worker_count == m_worker_threads.size()) {
+                        return;
+                    }
                 }
-                if (is_main_thread) {
-                    return;
-                } else {
-                    m_idle_worker_count.fetch_sub(1, std::memory_order_relaxed);
+                if (!is_main_thread) {
+                    start = m_last_tx_index.fetch_sub(m_batch_size, std::memory_order_relaxed);
                 }
-                start = m_last_tx_index.fetch_sub(m_batch_size, std::memory_order_relaxed);
             }
 
             auto& local_pairs{m_pairs[index]};
