@@ -7,15 +7,13 @@
 
 #include <coins.h>
 #include <primitives/transaction_identifier.h>
-#include <tinyformat.h>
 #include <txdb.h>
 #include <util/hasher.h>
-#include <util/threadnames.h>
+#include <util/threadpool.h>
 
 #include <cstdint>
-#include <semaphore>
+#include <future>
 #include <stdexcept>
-#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -32,17 +30,6 @@
 class InputFetcher
 {
 private:
-    /**
-     * Main thread releases this semaphore for each worker thread.
-     * Worker threads acquire this semaphore to start fetching.
-     */
-    std::counting_semaphore<> m_start_semaphore{0};
-    /**
-     * Worker threads release this semaphore once they are done fetching.
-     * Main thread acquires this semaphore for each worker thread.
-     */
-    std::counting_semaphore<> m_complete_semaphore{0};
-
     /**
      * The flattened indexes to each input in the block. The first item in the
      * pair is the index of the tx, and the second is the index of the vin.
@@ -80,20 +67,7 @@ private:
     const CBlock* m_block{nullptr};
 
     const size_t m_worker_thread_count;
-    std::vector<std::thread> m_worker_threads;
-    std::atomic<bool> m_request_stop{false};
-
-    void ThreadLoop(size_t index) noexcept
-    {
-        while (true) {
-            m_start_semaphore.acquire();
-            if (m_request_stop.load(std::memory_order_relaxed)) {
-                return;
-            }
-            Work(index);
-            m_complete_semaphore.release();
-        }
-    }
+    ThreadPool m_thread_pool{"inputfetcher"};
 
     void Work(size_t thread_index) noexcept
     {
@@ -141,25 +115,12 @@ public:
             // Don't do anything if there are no worker threads.
             return;
         }
+        m_thread_pool.Start(worker_thread_count);
         m_coins.reserve(worker_thread_count + 1);
-        m_worker_threads.reserve(worker_thread_count);
-        for (size_t n{0}; n < worker_thread_count; ++n) {
+        for (size_t n{0}; n < worker_thread_count + 1; ++n) {
             m_coins.emplace_back();
-            m_worker_threads.emplace_back([this, n]() {
-                util::ThreadRename(strprintf("inputfetch.%i", n));
-                ThreadLoop(n);
-            });
         }
-        // One more coins vector for the main thread
-        m_coins.emplace_back();
     }
-
-    // Since this class manages its own resources, which is a thread
-    // pool `m_worker_threads`, copy and move operations are not appropriate.
-    InputFetcher(const InputFetcher&) = delete;
-    InputFetcher& operator=(const InputFetcher&) = delete;
-    InputFetcher(InputFetcher&&) = delete;
-    InputFetcher& operator=(InputFetcher&&) = delete;
 
     //! Fetch all block inputs from db, and insert into cache.
     void FetchInputs(CCoinsViewCache& cache,
@@ -187,14 +148,20 @@ public:
 
         // Set the input counter and wake threads.
         m_input_counter.store(0, std::memory_order_relaxed);
-        m_start_semaphore.release(m_worker_thread_count);
+        std::vector<std::future<void>> futures;
+        futures.reserve(m_worker_thread_count);
+        for (size_t n{0}; n < m_worker_thread_count; ++n) {
+            futures.emplace_back(m_thread_pool.Submit([this, n]() {
+                Work(n);
+            }));
+        }
 
         // Have the main thread work too while we wait for other threads
         Work(m_worker_thread_count);
 
         // Wait for all worker threads to complete
-        for (size_t i{0}; i < m_worker_thread_count; ++i) {
-            m_complete_semaphore.acquire();
+        for (const auto& future : futures) {
+            future.wait();
         }
 
         // At this point all threads are done writing to m_coins, so we can
@@ -209,15 +176,6 @@ public:
         }
         m_txids.clear();
         m_inputs.clear();
-    }
-
-    ~InputFetcher()
-    {
-        m_request_stop.store(true, std::memory_order_relaxed);
-        m_start_semaphore.release(m_worker_thread_count);
-        for (std::thread& t : m_worker_threads) {
-            t.join();
-        }
     }
 };
 
