@@ -10,9 +10,9 @@
 #include <primitives/transaction_identifier.h>
 #include <tinyformat.h>
 #include <txdb.h>
-#include <util/hasher.h>
 #include <util/threadnames.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -74,7 +74,7 @@ private:
      * This is used to filter out inputs that are created in the block,
      * since they will not be in the db or the cache.
      */
-    std::unordered_set<Txid, SaltedTxidHasher> m_txids{};
+    std::vector<Txid> m_txids{};
 
     //! DB coins view to fetch from.
     const CCoinsView* m_db{nullptr};
@@ -116,7 +116,7 @@ private:
                 // If an input spends an outpoint from earlier in the
                 // block, it won't be in the cache yet but it also won't be
                 // in the db either.
-                if (m_txids.contains(outpoint.hash)) {
+                if (std::binary_search(m_txids.begin(), m_txids.end(), outpoint.hash)) {
                     continue;
                 }
                 if (m_cache->HaveCoinInCache(outpoint)) {
@@ -187,8 +187,10 @@ public:
             for (size_t j{0}; j < tx->vin.size(); ++j) {
                 m_inputs.emplace_back(i, j);
             }
-            m_txids.emplace(tx->GetHash());
+            m_txids.emplace_back(tx->GetHash());
         }
+
+        std::sort(m_txids.begin(), m_txids.end());
 
         // Set the input counter and wake threads.
         m_input_counter.store(0, std::memory_order_relaxed);
