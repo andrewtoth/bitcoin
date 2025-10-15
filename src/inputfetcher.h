@@ -16,12 +16,20 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <new>
 #include <semaphore>
 #include <stdexcept>
 #include <thread>
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+ 
+#ifdef __cpp_lib_hardware_interference_size
+    using std::hardware_destructive_interference_size;
+#else
+    constexpr std::size_t hardware_destructive_interference_size = 64;
+#endif
 
 /**
  * Helper for fetching inputs from the CoinsDB and inserting into the CoinsTip.
@@ -58,7 +66,7 @@ private:
      * Workers increment this counter when they assign themselves an input
      * from m_inputs to fetch.
      */
-    std::atomic<size_t> m_input_counter{0};
+    alignas(hardware_destructive_interference_size) std::atomic<size_t> m_input_counter{0};
 
     /**
      * The vector of vectors of outpoint:coin pairs.
@@ -67,7 +75,10 @@ private:
      * vectors in a thread safe way. After all threads are finished, the main
      * thread can loop through all vectors and write the coins to the cache.
      */
-    std::vector<std::vector<std::pair<COutPoint, Coin>>> m_coins{};
+    struct AlignedCoinsVector {
+        alignas(hardware_destructive_interference_size) std::vector<std::pair<COutPoint, Coin>> v{};
+    };
+    std::vector<AlignedCoinsVector> m_coins{};
 
     /**
      * The set of txids of all txs in the block being fetched.
@@ -104,15 +115,17 @@ private:
     void Work(size_t thread_index) noexcept
     {
         const auto inputs_count{m_inputs.size()};
-        auto& coins{m_coins[thread_index]};
+        auto& coins{m_coins[thread_index].v};
         try {
             while (true) {
-                const auto input_index{m_input_counter.fetch_add(1, std::memory_order_relaxed)};
+                const auto input_index{
+                    m_input_counter.fetch_add(1, std::memory_order_relaxed)};
                 if (input_index >= inputs_count) {
                     return;
                 }
                 const auto [tx_index, vin_index] = m_inputs[input_index];
-                const auto& outpoint{m_block->vtx[tx_index]->vin[vin_index].prevout};
+                const auto& outpoint{
+                    m_block->vtx[tx_index]->vin[vin_index].prevout};
                 // If an input spends an outpoint from earlier in the
                 // block, it won't be in the cache yet but it also won't be
                 // in the db either.
@@ -127,14 +140,16 @@ private:
                 } else {
                     // Missing an input. This block will fail validation.
                     // Skip remaining inputs.
-                    m_input_counter.store(inputs_count, std::memory_order_relaxed);
+                    m_input_counter.store(
+                        inputs_count, std::memory_order_relaxed);
                     return;
                 }
             }
         } catch (const std::runtime_error& e) {
             // Database error. This will be handled later in validation.
             // Skip remaining inputs.
-            LogPrintLevel(BCLog::VALIDATION, BCLog::Level::Warning, "InputFetcher failed to fetch input: %s.\n", e.what());
+            LogPrintLevel(BCLog::VALIDATION, BCLog::Level::Warning,
+                "InputFetcher failed to fetch input: %s.\n", e.what());
             m_input_counter.store(inputs_count, std::memory_order_relaxed);
         }
     }
@@ -152,7 +167,8 @@ public:
         m_worker_threads.reserve(worker_thread_count);
         for (size_t n{0}; n < worker_thread_count; ++n) {
             m_coins.emplace_back();
-            m_worker_threads.emplace_back(std::bind(&InputFetcher::ThreadLoop, this, n));
+            m_worker_threads.emplace_back(
+                std::bind(&InputFetcher::ThreadLoop, this, n));
         }
         // One more coins vector for the main thread
         m_coins.emplace_back();
@@ -178,13 +194,18 @@ public:
         m_cache = &cache;
         m_block = &block;
 
+        m_txids.clear();
+        m_inputs.clear();
+
         // Loop through the inputs of the block and add them to the queue.
         // Construct the set of txids to filter later.
-        m_txids.reserve(block.vtx.size() - 1);
-        for (size_t i{1}; i < block.vtx.size(); ++i) {
+        const auto txs_size{block.vtx.size()};
+        m_txids.reserve(txs_size - 1);
+        for (size_t i{1}; i < txs_size; ++i) {
             const auto& tx{block.vtx[i]};
-            m_inputs.reserve(m_inputs.size() + tx->vin.size());
-            for (size_t j{0}; j < tx->vin.size(); ++j) {
+            const auto tx_inputs_size{tx->vin.size()};
+            m_inputs.reserve(m_inputs.size() + tx_inputs_size);
+            for (size_t j{0}; j < tx_inputs_size; ++j) {
                 m_inputs.emplace_back(i, j);
             }
             m_txids.emplace(tx->GetHash());
@@ -205,16 +226,13 @@ public:
         // At this point all threads are done writing to m_coins and reading
         // from m_cache, so we can safely read from m_coins and insert the
         // the fetched coins into the cache.
-        for (auto& thread_coins : m_coins) {
-            for (auto&& [outpoint, coin] : thread_coins) {
-                cache.EmplaceCoinInternalDANGER(std::move(outpoint),
-                                                std::move(coin),
-                                                /*set_dirty=*/false);
+        for (auto& [coins] : m_coins) {
+            for (auto&& [outpoint, coin] : coins) {
+                cache.EmplaceCoinInternalDANGER(
+                    std::move(outpoint), std::move(coin));
             }
-            thread_coins.clear();
+            coins.clear();
         }
-        m_txids.clear();
-        m_inputs.clear();
     }
 
     ~InputFetcher()
