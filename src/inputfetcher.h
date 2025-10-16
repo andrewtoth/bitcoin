@@ -74,7 +74,7 @@ private:
 
     std::vector<std::thread> m_worker_threads;
     std::counting_semaphore<> m_start_semaphore{0};
-    std::counting_semaphore<> m_complete_semaphore{0};
+    std::atomic<size_t> m_complete_counter{0};
     std::atomic<bool> m_request_stop{false};
 
     void ThreadLoop(size_t thread_index) noexcept
@@ -87,7 +87,10 @@ private:
                 return;
             }
             Work(thread_index);
-            m_complete_semaphore.release();
+            const auto complete_count{m_complete_counter.fetch_add(1, std::memory_order_release)};
+            if (complete_count == m_worker_threads.size() - 1) {
+                m_complete_counter.notify_one();
+            }
         }
     }
 
@@ -165,14 +168,17 @@ public:
 
         // Set the input counter and wake threads.
         m_input_counter.store(0, std::memory_order_relaxed);
+        m_complete_counter.store(0, std::memory_order_relaxed);
         m_start_semaphore.release(m_worker_threads.size());
 
         // Have the main thread work too while we wait for other threads
         Work(m_worker_threads.size());
 
         // Wait for all worker threads to complete
-        for (size_t i{0}; i < m_worker_threads.size(); ++i) {
-            m_complete_semaphore.acquire();
+        auto complete_count{m_complete_counter.load(std::memory_order_acquire)};
+        while (complete_count < m_worker_threads.size()) {
+            m_complete_counter.wait(complete_count, std::memory_order_relaxed);
+            complete_count = m_complete_counter.load(std::memory_order_acquire);
         }
 
         // At this point all threads are done writing to m_coins and reading from m_cache,
