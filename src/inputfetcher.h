@@ -42,7 +42,7 @@ private:
      * The flattened indexes to each input in the block. The first item in the
      * pair is the index of the tx, and the second is the index of the vin.
      */
-    std::vector<std::pair<size_t, size_t>> m_inputs{};
+    std::vector<COutPoint> m_inputs{};
 
     /**
      * The set of txids of all txs in the block being fetched.
@@ -71,8 +71,6 @@ private:
     const CCoinsView* m_db{nullptr};
     //! The cache to write to.
     CCoinsViewCache* m_cache{nullptr};
-    //! The block whose prevouts we are fetching.
-    const CBlock* m_block{nullptr};
 
     std::vector<std::thread> m_worker_threads;
     std::counting_semaphore<> m_start_semaphore{0};
@@ -99,28 +97,32 @@ private:
 
     void Work(size_t thread_index) noexcept
     {
+        const auto CHUNK_SIZE{128};
         try {
             while (true) {
-                const auto input_index{m_input_counter.fetch_add(1, std::memory_order_relaxed)};
-                if (input_index >= m_inputs.size()) {
-                    return;
+                const auto start{m_input_counter.fetch_add(CHUNK_SIZE, std::memory_order_relaxed)};
+                const auto end{start + CHUNK_SIZE};
+                for (auto i{start}; i < std::min(end, m_inputs.size()); ++i) {
+                    auto&& outpoint{m_inputs[i]};
+                    // If an input spends an outpoint from earlier in the block,
+                    // it won't be in the cache yet but it also won't be in the db either.
+                    if (m_txids.contains(outpoint.hash)) {
+                        continue;
+                    }
+                    if (m_cache->HaveCoinInCache(outpoint)) {
+                        continue;
+                    }
+                    if (auto coin{m_db->GetCoin(outpoint)}) {
+                        m_coins[thread_index].emplace_back(std::move(outpoint), std::move(*coin));
+                    } else {
+                        // Missing an input. This block will fail validation.
+                        // Skip remaining inputs.
+                        m_input_counter.store(m_inputs.size(), std::memory_order_relaxed);
+                        return;
+                    }
                 }
-                const auto [tx_index, vin_index] = m_inputs[input_index];
-                const auto& outpoint{m_block->vtx[tx_index]->vin[vin_index].prevout};
-                // If an input spends an outpoint from earlier in the block,
-                // it won't be in the cache yet but it also won't be in the db either.
-                if (m_txids.contains(outpoint.hash)) {
-                    continue;
-                }
-                if (m_cache->HaveCoinInCache(outpoint)) {
-                    continue;
-                }
-                if (auto coin{m_db->GetCoin(outpoint)}; coin) {
-                    m_coins[thread_index].emplace_back(outpoint, std::move(*coin));
-                } else {
-                    // Missing an input. This block will fail validation.
-                    // Skip remaining inputs.
-                    m_input_counter.store(m_inputs.size(), std::memory_order_relaxed);
+
+                if (end >= m_inputs.size()) {
                     return;
                 }
             }
@@ -168,7 +170,6 @@ public:
 
         m_db = &db;
         m_cache = &cache;
-        m_block = &block;
         m_txids.clear();
         m_inputs.clear();
 
@@ -176,10 +177,13 @@ public:
         // Construct the set of txids to filter.
         for (size_t i{1}; i < block.vtx.size(); ++i) {
             for (size_t j{0}; j < block.vtx[i]->vin.size(); ++j) {
-                m_inputs.emplace_back(i, j);
+                const auto& outpoint{block.vtx[i]->vin[j].prevout};
+                m_inputs.emplace_back(outpoint);
             }
             m_txids.emplace(block.vtx[i]->GetHash());
         }
+
+        std::sort(m_inputs.begin(), m_inputs.end());
 
         // Set the input counter and wake threads.
         m_input_counter.store(0, std::memory_order_relaxed);
