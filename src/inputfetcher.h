@@ -54,12 +54,16 @@ private:
         //! Workers update this after setting the coin. The main thread spins on this until it is not WAITING.
         std::atomic<Status> status{Status::WAITING};
         //! The outpoint to fetch;
-        const COutPoint& outpoint;
+        const COutPoint* outpoint;
         //! The coin that workers will fetch and main thread will insert into cache.
         Coin coin{};
 
+        Input& operator=(Input&& other) noexcept {
+            outpoint = other.outpoint;
+            return *this;
+        }
         Input(Input&& other) noexcept : outpoint{other.outpoint} {} // Only moved in setup for reallocation.
-        Input(const COutPoint& o LIFETIMEBOUND) noexcept : outpoint{o} {}
+        Input(const COutPoint* o LIFETIMEBOUND) noexcept : outpoint{o} {}
     };
     std::vector<Input> m_inputs{};
 
@@ -92,21 +96,22 @@ private:
                     break;
                 }
                 auto& input{m_inputs[i]};
+                const auto& outpoint{*input.outpoint};
                 // If an input spends an outpoint from earlier in the block,
                 // it won't be in the cache yet but it also won't be in the db either.
-                if (m_txids.contains(input.outpoint.hash)) {
+                if (m_txids.contains(outpoint.hash)) {
                     input.status.store(Input::Status::SKIPPED, std::memory_order_relaxed);
                     continue;
                 }
                 try {
-                    if (auto coin{m_cache->GetPossiblySpentCoinFromCache(input.outpoint)}) {
+                    if (auto coin{m_cache->GetPossiblySpentCoinFromCache(outpoint)}) {
                         input.coin = std::move(*coin);
                         if (!input.coin.IsSpent()) [[likely]] { // Coin from cache could be spent
                             // We need release here, so setting coin 2 lines above happens before the main thread loads.
                             input.status.store(Input::Status::READY, std::memory_order_release);
                             continue;
                         }
-                    } else if (auto coin{m_db->GetCoin(input.outpoint)}) {
+                    } else if (auto coin{m_db->GetCoin(outpoint)}) {
                         input.coin = std::move(*coin); // Coin from db cannot be spent, it does not store spent coins
                         // We need release here, so setting coin in the previous line happens before the main thread loads.
                         input.status.store(Input::Status::READY, std::memory_order_release);
@@ -151,9 +156,10 @@ public:
             outputs_count += tx->vout.size();
             m_txids.emplace(tx->GetHash());
             for (const auto& input : tx->vin) {
-                m_inputs.emplace_back(input.prevout);
+                m_inputs.emplace_back(&input.prevout);
             }
         }
+        std::sort(m_inputs.begin(), m_inputs.end(), [](const Input& a, const Input& b) { return *a.outpoint < *b.outpoint; });
 
         // Setup shared pointers and start workers.
         m_db = &db;
@@ -170,7 +176,7 @@ public:
                 status = input.status.load(std::memory_order_acquire);
             }
             if (status == Input::Status::READY) {
-                temp_cache.EmplaceCoinInternalDANGER(COutPoint{input.outpoint}, std::move(input.coin));
+                temp_cache.EmplaceCoinInternalDANGER(COutPoint{*input.outpoint}, std::move(input.coin));
             } else if (status == Input::Status::FAILED) [[unlikely]] {
                 break;
             }
