@@ -8,19 +8,16 @@
 #include <attributes.h>
 #include <coins.h>
 #include <logging.h>
-#include <primitives/transaction_identifier.h>
 #include <tinyformat.h>
-#include <txdb.h>
-#include <util/hasher.h>
 #include <util/threadnames.h>
 
+#include <algorithm>
 #include <atomic>
 #include <barrier>
 #include <cstdint>
 #include <optional>
 #include <stdexcept>
 #include <thread>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -58,11 +55,11 @@ private:
     std::vector<Input> m_inputs{};
 
     /**
-     * The set of txids of all txs in the block being fetched.
+     * The set of first 8 bytes of txids of all txs in the block being fetched.
      * Used to filter out inputs that are created and spent in the same block,
      * since they will not be in the db or the cache.
      */
-    std::unordered_set<Txid, SaltedTxidHasher> m_txids{};
+    std::vector<uint64_t> m_txids{};
 
     //! DB coins view to fetch from.
     const CCoinsView* m_db{nullptr};
@@ -88,15 +85,19 @@ private:
         const size_t i{m_input_head.fetch_add(1, std::memory_order_relaxed)};
         if (i >= m_inputs.size()) [[unlikely]] return false;
         auto& input{m_inputs[i]};
+        if (std::binary_search(m_txids.begin(), m_txids.end(), input.outpoint.hash.ToUint256().GetUint64(0))) {
+            input.ready.test_and_set(std::memory_order_relaxed);
+            return true;
+        }
         auto coin{m_cache->GetPossiblySpentCoinFromCache(input.outpoint)};
-        if (!coin && !m_txids.contains(input.outpoint.hash)) {
+        if (!coin) {
             try {
                 coin = m_db->GetCoin(input.outpoint);
             } catch (const std::runtime_error& e) {
                 LogPrintLevel(BCLog::VALIDATION, BCLog::Level::Warning, "InputFetcher failed to fetch input: %s.\n", e.what());
             }
         }
-        if (coin && !coin->IsSpent()) input.coin = std::move(coin);
+        if (coin && !coin->IsSpent()) [[likely]] input.coin.emplace(std::move(*coin));
         // We need release here, so setting coin above happens before the main thread acquires.
         input.ready.test_and_set(std::memory_order_release);
         return true;
@@ -116,9 +117,10 @@ public:
         for (size_t i{1}; i < block.vtx.size(); ++i) {
             const auto& tx{block.vtx[i]};
             outputs_count += tx->vout.size();
-            m_txids.emplace(tx->GetHash());
+            m_txids.emplace_back(tx->GetHash().ToUint256().GetUint64(0));
             for (const auto& input : tx->vin) m_inputs.emplace_back(input.prevout);
         }
+        std::sort(m_txids.begin(), m_txids.end());
 
         // Setup shared pointers and start workers.
         m_db = &db;
@@ -129,7 +131,10 @@ public:
         // Insert fetched coins into the temp_cache as they are set to ready.
         temp_cache.Reserve(temp_cache.GetCacheSize() + m_inputs.size() + outputs_count);
         for (auto& input : m_inputs) {
-            while (!input.ready.test(std::memory_order_acquire)) FetchCoin(); // Work too while we wait
+            while (!input.ready.test(std::memory_order_acquire)) {
+                // Work too while we wait
+                if (!FetchCoin()) std::this_thread::yield();
+            }
             if (!input.coin) continue;
             temp_cache.EmplaceCoinInternalDANGER(COutPoint{input.outpoint}, std::move(*input.coin));
         }

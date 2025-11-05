@@ -122,14 +122,20 @@ BOOST_FIXTURE_TEST_CASE(fetch_inputs_from_cache, InputFetcherTest)
         CCoinsViewCache cache(&main_cache);
         getFetcher().FetchInputs(cache, main_cache, dummy, block);
 
+        std::unordered_set<Txid, SaltedTxidHasher> txids{};
+        txids.reserve(block.vtx.size() - 1);
+
         for (const auto& tx : block.vtx) {
             if (tx->IsCoinBase()) {
                 BOOST_CHECK(!cache.HaveCoinInCache(tx->vin[0].prevout));
             } else {
                 for (const auto& in : tx->vin) {
                     const auto& outpoint{in.prevout};
-                    BOOST_CHECK(cache.HaveCoinInCache(outpoint));
+                    const auto have{cache.HaveCoinInCache(outpoint)};
+                    const auto should_have{!txids.contains(outpoint.hash)};
+                    BOOST_CHECK(should_have ? have : !have);
                 }
+                txids.emplace(tx->GetHash());
             }
         }
     }
