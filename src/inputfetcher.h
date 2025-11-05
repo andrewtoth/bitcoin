@@ -17,6 +17,7 @@
 #include <atomic>
 #include <barrier>
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 #include <thread>
 #include <unordered_set>
@@ -45,11 +46,11 @@ private:
     //! The inputs of the block which is being fetched.
     struct Input {
         //! Workers update this after setting the coin. The main thread waits on this until it is not false.
-        std::atomic_bool ready{false};
+        std::atomic_flag ready{};
         //! The outpoint to fetch;
         const COutPoint& outpoint;
         //! The coin that workers will fetch and main thread will insert into cache.
-        Coin coin{};
+        std::optional<Coin> coin{std::nullopt};
 
         Input(Input&& other) noexcept : outpoint{other.outpoint} {} // Only moved in setup for reallocation.
         explicit Input(const COutPoint& o LIFETIMEBOUND) noexcept : outpoint{o} {}
@@ -77,27 +78,28 @@ private:
         while (true) {
             m_barrier.arrive_and_wait();
             if (m_request_stop) [[unlikely]] return;
-
-            while (true) {
-                const size_t i{m_input_head.fetch_add(1, std::memory_order_relaxed)};
-                if (i >= m_inputs.size()) [[unlikely]] break;
-                auto& input{m_inputs[i]};
-                auto coin{m_cache->GetPossiblySpentCoinFromCache(input.outpoint)};
-                if (!coin && !m_txids.contains(input.outpoint.hash)) {
-                    try {
-                        coin = m_db->GetCoin(input.outpoint);
-                    } catch (const std::runtime_error& e) {
-                        LogPrintLevel(BCLog::VALIDATION, BCLog::Level::Warning, "InputFetcher failed to fetch input: %s.\n", e.what());
-                    }
-                }
-                if (coin && !coin->IsSpent()) input.coin = std::move(*coin);
-                // We need release here, so setting coin above happens before the main thread acquires.
-                input.ready.store(true, std::memory_order_release);
-                input.ready.notify_one();
-            }
-
+            while (FetchCoin()) {}
             m_barrier.arrive_and_wait();
         }
+    }
+
+    bool FetchCoin() noexcept
+    {
+        const size_t i{m_input_head.fetch_add(1, std::memory_order_relaxed)};
+        if (i >= m_inputs.size()) [[unlikely]] return false;
+        auto& input{m_inputs[i]};
+        auto coin{m_cache->GetPossiblySpentCoinFromCache(input.outpoint)};
+        if (!coin && !m_txids.contains(input.outpoint.hash)) {
+            try {
+                coin = m_db->GetCoin(input.outpoint);
+            } catch (const std::runtime_error& e) {
+                LogPrintLevel(BCLog::VALIDATION, BCLog::Level::Warning, "InputFetcher failed to fetch input: %s.\n", e.what());
+            }
+        }
+        if (coin && !coin->IsSpent()) input.coin = std::move(coin);
+        // We need release here, so setting coin above happens before the main thread acquires.
+        input.ready.test_and_set(std::memory_order_release);
+        return true;
     }
 
 public:
@@ -127,9 +129,9 @@ public:
         // Insert fetched coins into the temp_cache as they are set to ready.
         temp_cache.Reserve(temp_cache.GetCacheSize() + m_inputs.size() + outputs_count);
         for (auto& input : m_inputs) {
-            input.ready.wait(false, std::memory_order_acquire);
-            if (input.coin.IsSpent()) continue;
-            temp_cache.EmplaceCoinInternalDANGER(COutPoint{input.outpoint}, std::move(input.coin));
+            while (!input.ready.test(std::memory_order_acquire)) FetchCoin(); // Work too while we wait
+            if (!input.coin) continue;
+            temp_cache.EmplaceCoinInternalDANGER(COutPoint{input.outpoint}, std::move(*input.coin));
         }
 
         m_barrier.arrive_and_wait();
