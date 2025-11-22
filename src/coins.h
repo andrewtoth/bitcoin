@@ -431,7 +431,7 @@ public:
      * Emplace a coin into cacheCoins without performing any checks, marking
      * the emplaced coin as dirty.
      *
-     * NOT FOR GENERAL USE. Used only when loading coins from a UTXO snapshot and in the InputFetcher.
+     * NOT FOR GENERAL USE. Used only when loading coins from a UTXO snapshot.
      * @sa ChainstateManager::PopulateAndValidateSnapshot()
      */
     void EmplaceCoinInternalDANGER(COutPoint&& outpoint, Coin&& coin);
@@ -469,12 +469,6 @@ public:
     //! Calculate the size of the cache (in number of transaction outputs)
     unsigned int GetCacheSize() const;
 
-    /**
-     * Reserve enough space in the cache so the underlying unordered_map will
-     * not have to rehash unless capacity is exceeded.
-     */
-    void Reserve(size_t capacity) noexcept { cacheCoins.reserve(capacity); }
-
     //! Calculate the size of the cache (in bytes)
     size_t DynamicMemoryUsage() const;
 
@@ -496,7 +490,7 @@ private:
      * @note this is marked const, but may actually append to `cacheCoins`, increasing
      * memory usage.
      */
-    CCoinsMap::iterator FetchCoin(const COutPoint &outpoint) const;
+    virtual CCoinsMap::iterator FetchCoin(const COutPoint &outpoint) const;
 };
 
 //! Utility function to add all of a transaction's outputs to a cache.

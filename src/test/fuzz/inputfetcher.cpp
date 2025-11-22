@@ -21,8 +21,7 @@
 using DbMap = std::map<const COutPoint, std::pair<std::optional<const Coin>, bool>>;
 
 struct DbCoinsView : CCoinsView {
-    DbMap& m_map;
-    DbCoinsView(DbMap& map) noexcept : m_map(map) {}
+    DbMap m_map{};
 
     std::optional<Coin> GetCoin(const COutPoint& outpoint) const override
     {
@@ -41,11 +40,14 @@ struct NoAccessCoinsView : CCoinsView {
 };
 
 std::optional<InputFetcher> g_fetcher{};
+std::optional<DbCoinsView> g_db{};
 
 static void setup_threadpool_test()
 {
     LogInstance().DisableLogging();
-    g_fetcher.emplace(3);
+    g_db.emplace();
+    CCoinsViewCache dummy{nullptr};
+    g_fetcher.emplace(3, dummy, *g_db);
 }
 
 FUZZ_TARGET(inputfetcher, .init = setup_threadpool_test)
@@ -58,10 +60,9 @@ FUZZ_TARGET(inputfetcher, .init = setup_threadpool_test)
         CBlock block;
         Txid prevhash{Txid::FromUint256(ConsumeUInt256(fuzzed_data_provider))};
 
-        DbMap db_map{};
+        DbMap& db_map{g_db->m_map};
+        db_map.clear();
         std::map<const COutPoint, const Coin> cache_map{};
-
-        DbCoinsView db(db_map);
 
         NoAccessCoinsView back;
         CCoinsViewCache main_cache(&back);
@@ -116,12 +117,14 @@ FUZZ_TARGET(inputfetcher, .init = setup_threadpool_test)
             block.vtx.push_back(MakeTransactionRef(tx));
         }
 
-        CCoinsViewCache cache(&back);
-        g_fetcher->FetchInputs(cache, main_cache, db, block);
+        InputFetcher& cache(*g_fetcher);
+        cache.SetBackend(main_cache);
+        cache.StartFetching(block);
 
         uint32_t coins_count{0};
         Coin empty_coin;
         for (const auto& [outpoint, pair] : db_map) {
+            cache.AccessCoin(outpoint);
             if (const auto coin{cache.GetPossiblySpentCoinFromCache(outpoint)}) {
                 ++coins_count;
                 // No spent coins should be inserted into the cache

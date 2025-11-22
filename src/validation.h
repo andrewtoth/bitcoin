@@ -486,6 +486,8 @@ public:
     //! can fit per the dbcache setting.
     std::unique_ptr<CCoinsViewCache> m_cacheview GUARDED_BY(cs_main);
 
+    std::unique_ptr<InputFetcher> m_ephemeral_view GUARDED_BY(cs_main);
+
     //! This constructor initializes CCoinsViewDB and CCoinsViewErrorCatcher instances, but it
     //! *does not* create a CCoinsViewCache instance by default. This is done separately because the
     //! presence of the cache has implications on whether or not we're allowed to flush the cache's
@@ -980,7 +982,6 @@ private:
 
     //! A queue for script verifications that have to be performed by worker threads.
     CCheckQueue<CScriptCheck> m_script_check_queue;
-    InputFetcher m_input_fetcher;
 
     //! Timers and counters used for benchmarking validation in both background
     //! and active chainstates.
@@ -1345,10 +1346,6 @@ public:
     void RecalculateBestHeader() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
     CCheckQueue<CScriptCheck>& GetCheckQueue() { return m_script_check_queue; }
-    void FetchInputs(CCoinsViewCache& temp_cache, const CCoinsViewCache& main_cache, const CCoinsView& db, const CBlock& block) noexcept
-    {
-        m_input_fetcher.FetchInputs(temp_cache, main_cache, db, block);
-    }
 
     ~ChainstateManager();
 };

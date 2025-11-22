@@ -21,6 +21,10 @@
 
 BOOST_AUTO_TEST_SUITE(inputfetcher_tests)
 
+struct NoAccessCoinsView : CCoinsView {
+    std::optional<Coin> GetCoin(const COutPoint&) const override { abort(); }
+};
+
 struct InputFetcherTest : BasicTestingSetup {
 private:
     std::unique_ptr<InputFetcher> m_fetcher{nullptr};
@@ -56,11 +60,8 @@ public:
         const auto cores{GetNumCores()};
         const auto num_txs{m_rng.randrange(cores * 10)};
         m_block = std::make_unique<CBlock>(CreateBlock(num_txs));
-        const auto worker_threads{m_rng.randrange(cores * 2) + 1};
-        m_fetcher = std::make_unique<InputFetcher>(worker_threads);
     }
 
-    InputFetcher& getFetcher() { return *m_fetcher; }
     const CBlock& getBlock() { return *m_block; }
 };
 
@@ -79,6 +80,7 @@ void PopulateCache(const CBlock& block, CCoinsViewCache& cache, bool spent = fal
 
 void CheckCache(const CBlock& block, const CCoinsViewCache& cache)
 {
+    uint32_t counter{0};
     std::unordered_set<Txid, SaltedTxidHasher> txids{};
     txids.reserve(block.vtx.size() - 1);
 
@@ -88,40 +90,48 @@ void CheckCache(const CBlock& block, const CCoinsViewCache& cache)
         } else {
             for (const auto& in : tx->vin) {
                 const auto& outpoint{in.prevout};
-                const auto have{cache.GetPossiblySpentCoinFromCache(outpoint)};
                 const auto should_have{!txids.contains(outpoint.hash)};
+                if (should_have) {
+                    cache.AccessCoin(outpoint);
+                    ++counter;
+                }
+                const auto have{cache.GetPossiblySpentCoinFromCache(outpoint)};
                 BOOST_CHECK(should_have ? !!have : !have);
             }
             txids.emplace(tx->GetHash());
         }
     }
+    BOOST_CHECK(cache.GetCacheSize() == counter);
 }
 
 
 BOOST_FIXTURE_TEST_CASE(fetch_inputs_from_db, InputFetcherTest)
 {
     const auto& block{getBlock()};
+    NoAccessCoinsView dummy;
+    CCoinsViewCache db(&dummy);
+    PopulateCache(block, db);
+    CCoinsViewCache main_cache(&dummy);
+    InputFetcher view{1, main_cache, db};
     for (auto i{0}; i < 3; ++i) {
-        CCoinsView dummy;
-        CCoinsViewCache db(&dummy);
-        PopulateCache(block, db);
-        CCoinsViewCache main_cache(&db);
-        CCoinsViewCache temp_cache(&main_cache);
-        getFetcher().FetchInputs(temp_cache, main_cache, db, block);
-        CheckCache(block, temp_cache);
+        view.StartFetching(block);
+        CheckCache(block, view);
+        view.Reset();
     }
 }
 
 BOOST_FIXTURE_TEST_CASE(fetch_inputs_from_cache, InputFetcherTest)
 {
     const auto& block{getBlock()};
+    NoAccessCoinsView dummy;
+    CCoinsViewCache db(&dummy);
+    CCoinsViewCache main_cache(&dummy);
+    PopulateCache(block, main_cache);
+    InputFetcher view{1, main_cache, db};
     for (auto i{0}; i < 3; ++i) {
-        CCoinsView dummy;
-        CCoinsViewCache main_cache(&dummy);
-        PopulateCache(block, main_cache);
-        CCoinsViewCache temp_cache(&main_cache);
-        getFetcher().FetchInputs(temp_cache, main_cache, dummy, block);
-        CheckCache(block, temp_cache);
+        view.StartFetching(block);
+        CheckCache(block, view);
+        view.Reset();
     }
 }
 
@@ -130,62 +140,52 @@ BOOST_FIXTURE_TEST_CASE(fetch_inputs_from_cache, InputFetcherTest)
 BOOST_FIXTURE_TEST_CASE(fetch_no_double_spend, InputFetcherTest)
 {
     const auto& block{getBlock()};
+    NoAccessCoinsView dummy;
+    CCoinsViewCache db(&dummy);
+    PopulateCache(block, db);
+    CCoinsViewCache main_cache(&dummy);
+    // Add all inputs as spent already in cache
+    PopulateCache(block, main_cache, /*spent=*/true);
+    InputFetcher view{1, main_cache, db};
     for (auto i{0}; i < 3; ++i) {
-        CCoinsView dummy;
-        CCoinsViewCache db(&dummy);
-        PopulateCache(block, db);
-        CCoinsViewCache main_cache(&db);
-        // Add all inputs as spent already in cache
-        PopulateCache(block, main_cache, /*spent=*/true);
-        CCoinsViewCache temp_cache(&main_cache);
-        getFetcher().FetchInputs(temp_cache, main_cache, db, block);
-        // Coins are not added to the temp cache, even though they exist unspent in the parent db
-        BOOST_CHECK(temp_cache.GetCacheSize() == 0);
+        view.StartFetching(block);
+        for (const auto& tx : block.vtx) {
+            for (const auto& in : tx->vin) view.AccessCoin(in.prevout);
+        }
+        // Coins are not added to the view, even though they exist unspent in the parent db
+        BOOST_CHECK(view.GetCacheSize() == 0);
+        view.Reset();
     }
 }
 
 BOOST_FIXTURE_TEST_CASE(fetch_no_inputs, InputFetcherTest)
 {
     const auto& block{getBlock()};
+    CCoinsView db;
+    CCoinsViewCache main_cache(&db);
+    InputFetcher view{1, main_cache, db};
     for (auto i{0}; i < 3; ++i) {
-        CCoinsView db;
-        CCoinsViewCache main_cache(&db);
-        CCoinsViewCache temp_cache(&main_cache);
-        getFetcher().FetchInputs(temp_cache, main_cache, db, block);
-        BOOST_CHECK(temp_cache.GetCacheSize() == 0);
-    }
-}
-
-struct ThrowCoinsView : CCoinsView {
-    std::optional<Coin> GetCoin(const COutPoint&) const override
-    {
-        throw std::runtime_error("database error");
-    }
-};
-
-BOOST_FIXTURE_TEST_CASE(fetch_input_exceptions, InputFetcherTest)
-{
-    const auto& block{getBlock()};
-    for (auto i{0}; i < 3; ++i) {
-        ThrowCoinsView db;
-        CCoinsViewCache main_cache(&db);
-        CCoinsViewCache temp_cache(&main_cache);
-        getFetcher().FetchInputs(temp_cache, main_cache, db, block);
-        BOOST_CHECK(temp_cache.GetCacheSize() == 0);
+        view.StartFetching(block);
+        for (const auto& tx : block.vtx) {
+            for (const auto& in : tx->vin) view.AccessCoin(in.prevout);
+        }
+        BOOST_CHECK(view.GetCacheSize() == 0);
+        view.Reset();
     }
 }
 
 BOOST_FIXTURE_TEST_CASE(fetch_with_zero_workers, InputFetcherTest)
 {
     const auto& block{getBlock()};
+    NoAccessCoinsView dummy;
+    CCoinsViewCache db(&dummy);
+    PopulateCache(block, db);
+    CCoinsViewCache main_cache(&dummy);
+    InputFetcher view{0, main_cache, db};
     for (auto i{0}; i < 3; ++i) {
-        CCoinsView db;
-        CCoinsViewCache main_cache(&db);
-        PopulateCache(block, main_cache);
-        CCoinsViewCache temp_cache(&main_cache);
-        InputFetcher fetcher{0};
-        fetcher.FetchInputs(temp_cache, main_cache, db, block);
-        BOOST_CHECK(temp_cache.GetCacheSize() == 0);
+        view.StartFetching(block);
+        CheckCache(block, view);
+        view.Reset();
     }
 }
 

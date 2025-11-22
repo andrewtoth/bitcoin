@@ -12,7 +12,7 @@
 #include <streams.h>
 #include <util/time.h>
 
-static constexpr auto DELAY{2ms};
+static constexpr auto DELAY{1ms};
 
 //! Simulates a DB by adding a delay when calling GetCoin
 struct DelayedCoinsView : CCoinsView {
@@ -32,17 +32,11 @@ static void InputFetcherBenchmark(benchmark::Bench& bench)
 
     DelayedCoinsView db{};
     CCoinsViewCache main_cache(&db);
-
-    // The main thread should be counted to prevent thread oversubscription, and
-    // to decrease the variance of benchmark results.
-    const auto worker_threads_num{GetNumCores() - 1};
-    InputFetcher fetcher{worker_threads_num};
+    InputFetcher fetcher{3, main_cache, db};
 
     bench.run([&] {
-        CCoinsViewCache temp_cache(&main_cache);
-        fetcher.FetchInputs(temp_cache, main_cache, db, block);
-        ankerl::nanobench::doNotOptimizeAway(&temp_cache);
-        Assert(temp_cache.GetCacheSize() == 4599);
+        fetcher.StartFetching(block);
+        fetcher.Reset();
     });
 }
 

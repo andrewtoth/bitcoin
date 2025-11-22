@@ -20,6 +20,7 @@
 #include <optional>
 #include <stdexcept>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -36,11 +37,11 @@
  * is used at the beginning of fetching to start the workers and at the end to
  * make sure all workers have exited the work loop.
  */
-class InputFetcher
+class InputFetcher : public CCoinsViewCache
 {
 private:
     //! The latest input being fetched. Workers atomically increment this when fetching.
-    std::atomic_uint32_t m_input_counter{0};
+    mutable std::atomic_uint32_t m_input_counter{0};
 
     //! The inputs of the block which is being fetched.
     struct InputToFetch {
@@ -58,25 +59,17 @@ private:
         InputToFetch(InputToFetch&& other) noexcept : outpoint{other.outpoint} {}
         explicit InputToFetch(const COutPoint& o LIFETIMEBOUND) noexcept : outpoint{o} {}
     };
-    std::vector<InputToFetch> m_inputs{};
+    mutable std::vector<InputToFetch> m_inputs{};
+    std::unordered_map<std::reference_wrapper<const COutPoint>, uint32_t, SaltedOutpointHasher> m_inputs_map{};
 
     /**
      * The set of first 8 bytes of txids of all txs in the block being fetched. This is used to filter out inputs that
      * are created and spent in the same block, since they will not be in the db or the cache.
-     * Using only the first 8 bytes is a performance improvement, versus storing the entire 32 bytes. In case of a
-     * collision of a txid in a block having the same first 8 bytes of a txid of an input being spent in that block,
-     * the input will be skipped by the input fetcher. This input will still be fetched later in ConnectBlock.
      */
     std::vector<uint64_t> m_txids{};
 
     //! DB coins view to fetch from.
-    const CCoinsView* m_db{nullptr};
-    //! The cache to fetch from.
-    const CCoinsViewCache* m_cache{nullptr};
-
-    std::vector<std::thread> m_worker_threads{};
-    std::barrier<> m_barrier;
-    bool m_request_stop{false};
+    const CCoinsView& m_db;
 
     /**
      * Fetches the next input in the queue. Safe to call from any thread once inside the barrier.
@@ -84,7 +77,7 @@ private:
      * @return true if there are more inputs in the queue to fetch
      * @return false if there are no more inputs in the queue to fetch
      */
-    bool FetchInput() noexcept
+    bool FetchCoinInBackground() const noexcept
     {
         const auto i{m_input_counter.fetch_add(1, std::memory_order_relaxed)};
         if (i >= m_inputs.size()) [[unlikely]] return false;
@@ -96,10 +89,10 @@ private:
             input.ready.notify_one();
             return true;
         }
-        auto coin{m_cache->GetPossiblySpentCoinFromCache(input.outpoint)};
+        auto coin{static_cast<CCoinsViewCache*>(base)->GetPossiblySpentCoinFromCache(input.outpoint)};
         if (!coin) {
             try {
-                coin = m_db->GetCoin(input.outpoint);
+                coin = m_db.GetCoin(input.outpoint);
             } catch (const std::runtime_error& e) {
                 LogPrintLevel(BCLog::VALIDATION, BCLog::Level::Warning, "InputFetcher failed to fetch input: %s.", e.what());
             }
@@ -111,66 +104,97 @@ private:
         return true;
     }
 
-public:
-    //! Fetch all block inputs from cache or db, and insert into temp_cache.
-    void FetchInputs(CCoinsViewCache& temp_cache, const CCoinsViewCache& cache, const CCoinsView& db, const CBlock& block) noexcept
+    CCoinsMap::iterator FetchCoin(const COutPoint &outpoint) const override
     {
-        if (block.vtx.size() <= 1 || m_worker_threads.size() == 0) return;
-
-        // Loop through the inputs of the block and set them in the queue.
-        // Construct the set of txids to filter, and count the outputs to reserve for temp_cache.
-        m_txids.reserve(block.vtx.size() - 1);
-        m_inputs.reserve(2 * block.vtx.size()); // rough guess
-        auto outputs_count{block.vtx[0]->vout.size()};
-        for (uint32_t i{1}; i < block.vtx.size(); ++i) {
-            const auto& tx{block.vtx[i]};
-            outputs_count += tx->vout.size();
-            m_txids.emplace_back(tx->GetHash().ToUint256().GetUint64(0));
-            for (const auto& input : tx->vin) m_inputs.emplace_back(input.prevout);
-        }
-        std::ranges::sort(m_txids);
-
-        // Setup shared pointers and start workers.
-        m_db = &db;
-        m_cache = &cache;
-        m_input_counter.store(0, std::memory_order_relaxed);
-        m_barrier.arrive_and_wait();
-
-        // Insert fetched coins into the temp_cache as they are set to ready.
-        temp_cache.Reserve(temp_cache.GetCacheSize() + m_inputs.size() + outputs_count);
-        for (auto& input : m_inputs) {
-            // Check if the coin is ready to be read. We need to acquire to match the worker thread's release.
-            while (!input.ready.test(std::memory_order_acquire)) {
-                // Work instead of waiting
-                if (!FetchInput()) {
-                    // No more work, just wait
-                    input.ready.wait(/*old=*/false, std::memory_order_acquire);
-                    break;
+        const auto [ret, inserted] = cacheCoins.try_emplace(outpoint);
+        if (inserted) {
+            if (const auto& it{m_inputs_map.find(outpoint)}; it != m_inputs_map.end()) [[likely]] {
+                auto& input{m_inputs[it->second]};
+                // Check if the coin is ready to be read. We need to acquire to match the worker thread's release.
+                while (!input.ready.test(std::memory_order_acquire)) {
+                    // Work instead of waiting if the coin is not ready
+                    if (!FetchCoinInBackground()) {
+                        // No more work, just wait
+                        input.ready.wait(/*old=*/false, std::memory_order_acquire);
+                        break;
+                    }
+                }
+                if (input.coin) [[likely]] ret->second.coin = std::move(*input.coin);
+            }
+            if (ret->second.coin.IsSpent()) [[unlikely]] {
+                // We will only get in here for BIP30 checks, txid collisions, or a block with missing or spent inputs.
+                // We need to wait for all threads to finish before we can mutate base.
+                FinishFetching();
+                if (auto coin{base->GetCoin(outpoint)}) {
+                    ret->second.coin = std::move(*coin);
+                } else {
+                    cacheCoins.erase(ret);
+                    return cacheCoins.end();
                 }
             }
-            if (input.coin) {
-                temp_cache.EmplaceCoinInternalDANGER(COutPoint{input.outpoint}, std::move(*input.coin));
-            }
+            cachedCoinsUsage += ret->second.coin.DynamicMemoryUsage();
         }
-
-        m_barrier.arrive_and_wait();
-        // Cleanup after all worker threads have exited the inner loop.
-        m_txids.clear();
-        m_inputs.clear();
-        m_db = nullptr;
-        m_cache = nullptr;
+        return ret;
     }
 
-    explicit InputFetcher(int32_t worker_thread_count) noexcept : m_barrier{worker_thread_count + 1}
+    std::vector<std::thread> m_worker_threads{};
+    mutable std::barrier<> m_barrier;
+    bool m_request_stop{false};
+
+    mutable bool m_finished_fetching{false};
+    void FinishFetching() const noexcept
     {
-        if (worker_thread_count <= 0) return;
+        if (m_finished_fetching) return;
+        while (FetchCoinInBackground()) {}
+        m_barrier.arrive_and_wait();
+        m_finished_fetching = true;
+    }
+
+public:
+    //! Start fetching all block inputs in parallel.
+    void StartFetching(const CBlock& block) noexcept
+    {
+        // Loop through the inputs of the block and set them in the queue.
+        // Construct the set of txids to filter, and count the outputs to reserve in cacheCoins.
+        auto outputs{0};
+        for (const auto& tx : block.vtx) {
+            outputs += tx->vout.size();
+            if (tx->IsCoinBase()) continue;
+            m_txids.emplace_back(tx->GetHash().ToUint256().GetUint64(0));
+            for (const auto& input : tx->vin) {
+                m_inputs_map.try_emplace(std::ref(input.prevout), m_inputs.size());
+                m_inputs.emplace_back(input.prevout);
+            }
+        }
+        std::ranges::sort(m_txids);
+        // Start workers.
+        m_barrier.arrive_and_wait();
+        cacheCoins.reserve(outputs + m_inputs.size());
+    }
+
+    void Reset() noexcept
+    {
+        FinishFetching();
+        m_input_counter.store(0, std::memory_order_relaxed);
+        m_txids.clear();
+        m_inputs.clear();
+        m_inputs_map.clear();
+        m_finished_fetching = false;
+        cacheCoins.clear();
+        cachedCoinsUsage = 0;
+        hashBlock = uint256::ZERO;
+    }
+
+    explicit InputFetcher(int32_t worker_thread_count, CCoinsViewCache& cache, const CCoinsView& db) noexcept
+        : CCoinsViewCache{&cache}, m_db{db}, m_barrier{worker_thread_count + 1}
+    {
         for (auto n{0}; n < worker_thread_count; ++n) {
             m_worker_threads.emplace_back([this, n] {
                 util::ThreadRename(strprintf("inputfetch.%i", n));
                 while (true) {
                     m_barrier.arrive_and_wait();
                     if (m_request_stop) [[unlikely]] return;
-                    while (FetchInput()) {}
+                    while (FetchCoinInBackground()) {}
                     m_barrier.arrive_and_wait();
                 }
             });
