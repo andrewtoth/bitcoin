@@ -60,7 +60,6 @@ private:
         explicit InputToFetch(const COutPoint& o LIFETIMEBOUND) noexcept : outpoint{o} {}
     };
     mutable std::vector<InputToFetch> m_inputs{};
-    std::unordered_map<std::reference_wrapper<const COutPoint>, uint32_t, SaltedOutpointHasher> m_inputs_map{};
 
     /**
      * The set of first 8 bytes of txids of all txs in the block being fetched. This is used to filter out inputs that
@@ -104,12 +103,22 @@ private:
         return true;
     }
 
+    mutable int32_t m_local_input_counter{-1};
     CCoinsMap::iterator FetchCoin(const COutPoint &outpoint) const override
     {
         const auto [ret, inserted] = cacheCoins.try_emplace(outpoint);
         if (inserted) {
-            if (const auto& it{m_inputs_map.find(outpoint)}; it != m_inputs_map.end()) [[likely]] {
-                auto& input{m_inputs[it->second]};
+            bool found{false};
+            auto prev{m_local_input_counter};
+            for (auto i{static_cast<size_t>(m_local_input_counter + 1)}; i < m_inputs.size(); ++i) {
+                if (m_inputs[i].outpoint == outpoint) {
+                    m_local_input_counter = i;
+                    found = true;
+                    break;
+                }
+            }
+            if (found) [[likely]] {
+                auto& input{m_inputs[m_local_input_counter]};
                 // Check if the coin is ready to be read. We need to acquire to match the worker thread's release.
                 while (!input.ready.test(std::memory_order_acquire)) {
                     // Work instead of waiting if the coin is not ready
@@ -128,6 +137,7 @@ private:
                 if (auto coin{base->GetCoin(outpoint)}) {
                     ret->second.coin = std::move(*coin);
                 } else {
+                    m_local_input_counter = prev;
                     cacheCoins.erase(ret);
                     return cacheCoins.end();
                 }
@@ -156,13 +166,12 @@ public:
     {
         // Loop through the inputs of the block and set them in the queue.
         // Construct the set of txids to filter, and count the outputs to reserve in cacheCoins.
-        auto outputs{0};
-        for (const auto& tx : block.vtx) {
+        auto outputs{block.vtx[0]->vout.size()};
+        for (size_t i{1}; i < block.vtx.size(); ++i) {
+            const auto& tx{block.vtx[i]};
             outputs += tx->vout.size();
-            if (tx->IsCoinBase()) continue;
             m_txids.emplace_back(tx->GetHash().ToUint256().GetUint64(0));
             for (const auto& input : tx->vin) {
-                m_inputs_map.try_emplace(std::ref(input.prevout), m_inputs.size());
                 m_inputs.emplace_back(input.prevout);
             }
         }
@@ -176,9 +185,9 @@ public:
     {
         FinishFetching();
         m_input_counter.store(0, std::memory_order_relaxed);
+        m_local_input_counter = -1;
         m_txids.clear();
         m_inputs.clear();
-        m_inputs_map.clear();
         m_finished_fetching = false;
         cacheCoins.clear();
         cachedCoinsUsage = 0;
