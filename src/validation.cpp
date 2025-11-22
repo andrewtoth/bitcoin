@@ -1937,7 +1937,7 @@ void CoinsViews::InitCache()
 {
     AssertLockHeld(::cs_main);
     m_cacheview = std::make_unique<CCoinsViewCache>(&m_catcherview);
-    m_ephemeral_view = std::make_unique<InputFetcher>(3, *m_cacheview, m_dbview);
+    m_ephemeral_view = std::make_unique<InputFetcher>(15, *m_cacheview, m_dbview);
 }
 
 Chainstate::Chainstate(
