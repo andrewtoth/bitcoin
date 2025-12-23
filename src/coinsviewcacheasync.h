@@ -7,9 +7,11 @@
 
 #include <attributes.h>
 #include <coins.h>
+#include <crypto/common.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <optional>
 #include <ranges>
@@ -72,6 +74,17 @@ private:
     mutable std::vector<InputToFetch> m_inputs{};
 
     /**
+     * The sorted first 8 bytes of txids of all txs in the block being fetched. This is used to filter out inputs that
+     * are created earlier in the same block, since they will not be in the db or the cache.
+     * Using only the first 8 bytes is a performance improvement, versus storing the entire 32 bytes. In case of a
+     * collision of an input being spent having the same first 8 bytes as a txid of a tx elsewhere in the block,
+     * the input will not be fetched in the background. The input will still be fetched later on the main thread.
+     * Using a sorted vector and binary search lookups is a performance improvement. It is faster than
+     * using std::unordered_set with salted hash or std::set.
+     */
+    std::vector<uint64_t> m_txids{};
+
+    /**
      * Claim and fetch the next input in the queue.
      *
      * @return true if there are more inputs in the queue to fetch
@@ -83,6 +96,11 @@ private:
         if (i >= m_inputs.size()) [[unlikely]] return false;
 
         auto& input{m_inputs[i]};
+        // Inputs spending a coin from a tx earlier in the block won't be in the cache or db
+        if (std::ranges::binary_search(m_txids, ReadLE64(input.outpoint.hash.begin()))) {
+            return true;
+        }
+
         if (auto coin{base->PeekCoin(input.outpoint)}) [[likely]] input.coin.emplace(std::move(*coin));
         return true;
     }
@@ -99,11 +117,11 @@ private:
             m_input_tail = i + 1;
             // We can move the coin since we won't access this input again.
             if (input.coin) [[likely]] return std::move(*input.coin);
-            // This block has missing or spent inputs.
+            // This block has missing or spent inputs or there is a shorttxid collision.
             break;
         }
 
-        // We will only get in here for BIP30 checks or a block with missing or spent inputs.
+        // We will only get in here for BIP30 checks, shorttxid collisions or a block with missing or spent inputs.
         return base->PeekCoin(outpoint);
     }
 
@@ -113,6 +131,7 @@ private:
         m_inputs.clear();
         m_input_head = 0;
         m_input_tail = 0;
+        m_txids.clear();
     }
 
 public:
@@ -120,13 +139,18 @@ public:
     [[nodiscard]] FetchControl StartFetching(const CBlock& block LIFETIMEBOUND) noexcept
     {
         StopFetching();
-        // Loop through the inputs of the block and set them in the queue.
+        // Loop through the inputs of the block and set them in the queue. Also construct the set of txids to filter.
         for (const auto& tx : block.vtx | std::views::drop(1)) [[likely]] {
             for (const auto& input : tx->vin) [[likely]] m_inputs.emplace_back(input.prevout);
+            m_txids.emplace_back(ReadLE64(tx->GetHash().begin()));
         }
         // Don't start if there's nothing to fetch.
         if (!m_inputs.empty()) [[likely]] {
+            // Sort txids so we can do binary search lookups.
+            std::ranges::sort(m_txids);
             while (ProcessInput()) [[likely]] {}
+        } else {
+            m_txids.clear();
         }
         return FetchControl{*this};
     }
