@@ -3,12 +3,15 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <coins.h>
+#include <coinsviewcacheasync.h>
 #include <consensus/amount.h>
 #include <consensus/tx_check.h>
 #include <consensus/tx_verify.h>
 #include <consensus/validation.h>
 #include <policy/policy.h>
+#include <primitives/block.h>
 #include <primitives/transaction.h>
+#include <primitives/transaction_identifier.h>
 #include <script/interpreter.h>
 #include <test/fuzz/FuzzedDataProvider.h>
 #include <test/fuzz/fuzz.h>
@@ -19,6 +22,7 @@
 
 #include <cassert>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -35,18 +39,26 @@ bool operator==(const Coin& a, const Coin& b)
     if (a.IsSpent() && b.IsSpent()) return true;
     return a.fCoinBase == b.fCoinBase && a.nHeight == b.nHeight && a.out == b.out;
 }
+
+std::unique_ptr<CoinsViewCacheAsync> g_async_cache{};
 } // namespace
 
 void initialize_coins_view()
 {
     static const auto testing_setup = MakeNoLogFileContext<>();
+    g_async_cache = std::make_unique<CoinsViewCacheAsync>(nullptr, /*deterministic=*/true);
 }
 
 void TestCoinsView(FuzzedDataProvider& fuzzed_data_provider, CCoinsView& backend_coins_view, bool is_db)
 {
     bool good_data{true};
 
-    CCoinsViewCache coins_view_cache{&backend_coins_view, /*deterministic=*/true};
+    const bool use_async_cache{fuzzed_data_provider.ConsumeBool()};
+    CCoinsViewCache regular_cache{&backend_coins_view, /*deterministic=*/true};
+    if (use_async_cache) {
+        g_async_cache->SetBackend(backend_coins_view);
+    }
+    CCoinsViewCache& coins_view_cache = use_async_cache ? *g_async_cache : regular_cache;
     if (is_db) coins_view_cache.SetBestBlock(uint256::ONE);
     COutPoint random_out_point;
     Coin random_coin;
@@ -126,6 +138,35 @@ void TestCoinsView(FuzzedDataProvider& fuzzed_data_provider, CCoinsView& backend
                     return;
                 }
                 random_mutable_transaction = *opt_mutable_transaction;
+            },
+            [&] {
+                if (!use_async_cache) return;
+                CBlock block;
+                Txid prevhash{Txid::FromUint256(ConsumeUInt256(fuzzed_data_provider))};
+                LIMITED_WHILE(fuzzed_data_provider.ConsumeBool(), 100)
+                {
+                    CMutableTransaction tx;
+                    LIMITED_WHILE(fuzzed_data_provider.ConsumeBool(), 100)
+                    {
+                        Txid txid;
+                        if (fuzzed_data_provider.ConsumeBool()) {
+                            txid = Txid::FromUint256(ConsumeUInt256(fuzzed_data_provider));
+                        } else if (fuzzed_data_provider.ConsumeBool()) {
+                            // Reuse previous tx hash (intra-block spending)
+                            txid = prevhash;
+                        } else {
+                            // Test shortid collisions - copy first 8 bytes from prevhash
+                            uint256 u{ConsumeUInt256(fuzzed_data_provider)};
+                            std::memcpy(u.begin(), prevhash.ToUint256().begin(), 8);
+                            txid = Txid::FromUint256(u);
+                        }
+                        const auto index{fuzzed_data_provider.ConsumeIntegral<uint32_t>()};
+                        tx.vin.emplace_back(COutPoint{txid, index});
+                    }
+                    prevhash = tx.GetHash();
+                    block.vtx.push_back(MakeTransactionRef(tx));
+                }
+                g_async_cache->StartFetching(block);
             },
             [&] {
                 CoinsCachePair sentinel{};
@@ -297,6 +338,8 @@ void TestCoinsView(FuzzedDataProvider& fuzzed_data_provider, CCoinsView& backend
                 (void)IsWitnessStandard(CTransaction{random_mutable_transaction}, coins_view_cache);
             });
     }
+
+    g_async_cache->Reset();
 }
 
 FUZZ_TARGET(coins_view, .init = initialize_coins_view)
