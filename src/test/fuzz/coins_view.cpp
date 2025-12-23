@@ -60,6 +60,8 @@ void TestCoinsView(FuzzedDataProvider& fuzzed_data_provider, CCoinsView& backend
     }
     CCoinsViewCache& coins_view_cache = use_async_cache ? *g_async_cache : regular_cache;
     if (is_db) coins_view_cache.SetBestBlock(uint256::ONE);
+    // Track if async cache is stopped (starts stopped, stops on Reset/Flush/Sync)
+    bool async_stopped{true};
     COutPoint random_out_point;
     Coin random_coin;
     CMutableTransaction random_mutable_transaction;
@@ -87,9 +89,11 @@ void TestCoinsView(FuzzedDataProvider& fuzzed_data_provider, CCoinsView& backend
             },
             [&] {
                 (void)coins_view_cache.Flush(/*will_reuse_cache=*/fuzzed_data_provider.ConsumeBool());
+                async_stopped = true;
             },
             [&] {
                 (void)coins_view_cache.Sync();
+                async_stopped = true;
             },
             [&] {
                 uint256 best_block{ConsumeUInt256(fuzzed_data_provider)};
@@ -101,6 +105,7 @@ void TestCoinsView(FuzzedDataProvider& fuzzed_data_provider, CCoinsView& backend
                 coins_view_cache.Reset();
                 // Set best block hash to non-null to satisfy the assertion in CCoinsViewDB::BatchWrite().
                 if (is_db) coins_view_cache.SetBestBlock(uint256::ONE);
+                async_stopped = true;
             },
             [&] {
                 Coin move_to;
@@ -140,7 +145,7 @@ void TestCoinsView(FuzzedDataProvider& fuzzed_data_provider, CCoinsView& backend
                 random_mutable_transaction = *opt_mutable_transaction;
             },
             [&] {
-                if (!use_async_cache) return;
+                if (!use_async_cache || !async_stopped) return;
                 CBlock block;
                 Txid prevhash{Txid::FromUint256(ConsumeUInt256(fuzzed_data_provider))};
                 LIMITED_WHILE(fuzzed_data_provider.ConsumeBool(), 100)
@@ -167,6 +172,7 @@ void TestCoinsView(FuzzedDataProvider& fuzzed_data_provider, CCoinsView& backend
                     block.vtx.push_back(MakeTransactionRef(tx));
                 }
                 g_async_cache->StartFetching(block);
+                async_stopped = false;
             },
             [&] {
                 CoinsCachePair sentinel{};
