@@ -141,7 +141,7 @@ private:
 
         if (ret->second.coin.IsSpent()) [[unlikely]] {
             // We will only get in here for BIP30 checks, shorttxid collisions, or a block with missing or spent inputs.
-            if (auto coin{FetchCoinWithoutMutating(outpoint)}) {
+            if (auto coin{FetchCoinWithoutMutating(outpoint)}; coin && !coin->IsSpent()) {
                 ret->second.coin = std::move(*coin);
             } else {
                 cacheCoins.erase(ret);
@@ -195,6 +195,12 @@ public:
     {
         StopFetching();
         return CCoinsViewCache::Sync();
+    }
+
+    void SetBackend(CCoinsView &viewIn) override
+    {
+        StopFetching();
+        return CCoinsViewCache::SetBackend(viewIn);
     }
 
     void Reset() noexcept override

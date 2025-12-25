@@ -41,27 +41,20 @@ bool operator==(const Coin& a, const Coin& b)
 }
 
 std::unique_ptr<CoinsViewCacheAsync> g_async_cache{};
+std::unique_ptr<CBlock> g_async_block{};
 } // namespace
 
 void initialize_coins_view()
 {
     static const auto testing_setup = MakeNoLogFileContext<>();
     g_async_cache = std::make_unique<CoinsViewCacheAsync>(nullptr, /*deterministic=*/true);
+    g_async_block = std::make_unique<CBlock>();
 }
 
-void TestCoinsView(FuzzedDataProvider& fuzzed_data_provider, CCoinsView& backend_coins_view, bool is_db)
+void TestCoinsView(FuzzedDataProvider& fuzzed_data_provider, CCoinsViewCache& coins_view_cache, CCoinsView& backend_coins_view, bool is_db)
 {
     bool good_data{true};
-
-    const bool use_async_cache{fuzzed_data_provider.ConsumeBool()};
-    CCoinsViewCache regular_cache{&backend_coins_view, /*deterministic=*/true};
-    if (use_async_cache) {
-        g_async_cache->SetBackend(backend_coins_view);
-    }
-    CCoinsViewCache& coins_view_cache = use_async_cache ? *g_async_cache : regular_cache;
     if (is_db) coins_view_cache.SetBestBlock(uint256::ONE);
-    // Track if async cache is stopped (starts stopped, stops on Reset/Flush/Sync)
-    bool async_stopped{true};
     COutPoint random_out_point;
     Coin random_coin;
     CMutableTransaction random_mutable_transaction;
@@ -89,11 +82,9 @@ void TestCoinsView(FuzzedDataProvider& fuzzed_data_provider, CCoinsView& backend
             },
             [&] {
                 (void)coins_view_cache.Flush(/*will_reuse_cache=*/fuzzed_data_provider.ConsumeBool());
-                async_stopped = true;
             },
             [&] {
                 (void)coins_view_cache.Sync();
-                async_stopped = true;
             },
             [&] {
                 uint256 best_block{ConsumeUInt256(fuzzed_data_provider)};
@@ -105,7 +96,6 @@ void TestCoinsView(FuzzedDataProvider& fuzzed_data_provider, CCoinsView& backend
                 coins_view_cache.Reset();
                 // Set best block hash to non-null to satisfy the assertion in CCoinsViewDB::BatchWrite().
                 if (is_db) coins_view_cache.SetBestBlock(uint256::ONE);
-                async_stopped = true;
             },
             [&] {
                 Coin move_to;
@@ -145,8 +135,12 @@ void TestCoinsView(FuzzedDataProvider& fuzzed_data_provider, CCoinsView& backend
                 random_mutable_transaction = *opt_mutable_transaction;
             },
             [&] {
-                if (!use_async_cache || !async_stopped) return;
-                CBlock block;
+                auto* async_cache = dynamic_cast<CoinsViewCacheAsync*>(&coins_view_cache);
+                if (!async_cache) return;
+                coins_view_cache.Reset();
+                // Set best block hash to non-null to satisfy the assertion in CCoinsViewDB::BatchWrite().
+                if (is_db) coins_view_cache.SetBestBlock(uint256::ONE);
+                g_async_block = std::make_unique<CBlock>();
                 Txid prevhash{Txid::FromUint256(ConsumeUInt256(fuzzed_data_provider))};
                 LIMITED_WHILE(fuzzed_data_provider.ConsumeBool(), 100)
                 {
@@ -169,10 +163,9 @@ void TestCoinsView(FuzzedDataProvider& fuzzed_data_provider, CCoinsView& backend
                         tx.vin.emplace_back(COutPoint{txid, index});
                     }
                     prevhash = tx.GetHash();
-                    block.vtx.push_back(MakeTransactionRef(tx));
+                    g_async_block->vtx.push_back(MakeTransactionRef(tx));
                 }
-                g_async_cache->StartFetching(block);
-                async_stopped = false;
+                async_cache->StartFetching(*g_async_block);
             },
             [&] {
                 CoinsCachePair sentinel{};
@@ -345,14 +338,15 @@ void TestCoinsView(FuzzedDataProvider& fuzzed_data_provider, CCoinsView& backend
             });
     }
 
-    g_async_cache->Reset();
+    coins_view_cache.Reset();
 }
 
 FUZZ_TARGET(coins_view, .init = initialize_coins_view)
 {
     FuzzedDataProvider fuzzed_data_provider{buffer.data(), buffer.size()};
     CCoinsView backend_coins_view;
-    TestCoinsView(fuzzed_data_provider, backend_coins_view, /*is_db=*/false);
+    CCoinsViewCache coins_view_cache{&backend_coins_view, /*deterministic=*/true};
+    TestCoinsView(fuzzed_data_provider, coins_view_cache, backend_coins_view, /*is_db=*/false);
 }
 
 FUZZ_TARGET(coins_view_db, .init = initialize_coins_view)
@@ -363,6 +357,28 @@ FUZZ_TARGET(coins_view_db, .init = initialize_coins_view)
         .cache_bytes = 1_MiB,
         .memory_only = true,
     };
-    CCoinsViewDB coins_db{std::move(db_params), CoinsViewOptions{}};
-    TestCoinsView(fuzzed_data_provider, coins_db, /*is_db=*/true);
+    CCoinsViewDB backend_coins_view{std::move(db_params), CoinsViewOptions{}};
+    CCoinsViewCache coins_view_cache{&backend_coins_view, /*deterministic=*/true};
+    TestCoinsView(fuzzed_data_provider, coins_view_cache, backend_coins_view, /*is_db=*/true);
+}
+
+FUZZ_TARGET(coins_view_async, .init = initialize_coins_view)
+{
+    FuzzedDataProvider fuzzed_data_provider{buffer.data(), buffer.size()};
+    CCoinsView backend_coins_view;
+    g_async_cache->SetBackend(backend_coins_view);
+    TestCoinsView(fuzzed_data_provider, *g_async_cache, backend_coins_view, /*is_db=*/false);
+}
+
+FUZZ_TARGET(coins_view_async_db, .init = initialize_coins_view)
+{
+    FuzzedDataProvider fuzzed_data_provider{buffer.data(), buffer.size()};
+    auto db_params = DBParams{
+        .path = "",
+        .cache_bytes = 1_MiB,
+        .memory_only = true,
+    };
+    CCoinsViewDB backend_coins_view{std::move(db_params), CoinsViewOptions{}};
+    g_async_cache->SetBackend(backend_coins_view);
+    TestCoinsView(fuzzed_data_provider, *g_async_cache, backend_coins_view, /*is_db=*/true);
 }
