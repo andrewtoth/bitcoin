@@ -156,17 +156,6 @@ private:
     std::vector<std::thread> m_worker_threads{};
     std::barrier<> m_barrier;
 
-    //! Stop all worker threads.
-    void StopFetching() noexcept
-    {
-        if (m_inputs.empty()) return;
-        // Skip fetching the rest of the inputs by moving the head to the end.
-        m_input_head.store(m_inputs.size(), std::memory_order_relaxed);
-        // Wait for all threads to stop.
-        m_barrier.arrive_and_wait();
-        m_inputs.clear();
-    }
-
 public:
     //! Fetch all block inputs.
     void StartFetching(const CBlock& block) noexcept
@@ -183,6 +172,20 @@ public:
         std::ranges::sort(m_txids);
         // Start workers by entering the barrier.
         m_barrier.arrive_and_wait();
+    }
+
+    //! Stop all worker threads.
+    void StopFetching() noexcept
+    {
+        if (m_inputs.empty()) return;
+        // Skip fetching the rest of the inputs by moving the head to the end.
+        m_input_head.store(m_inputs.size(), std::memory_order_relaxed);
+        // Wait for all threads to stop.
+        m_barrier.arrive_and_wait();
+        m_inputs.clear();
+        m_input_tail = 0;
+        m_input_head.store(0, std::memory_order_relaxed);
+        m_txids.clear();
     }
 
     bool Flush(bool will_reuse_cache) override
@@ -206,9 +209,6 @@ public:
     void Reset() noexcept override
     {
         StopFetching();
-        m_input_head.store(0, std::memory_order_relaxed);
-        m_input_tail = 0;
-        m_txids.clear();
         CCoinsViewCache::Reset();
     }
 

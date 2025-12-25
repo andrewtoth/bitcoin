@@ -213,4 +213,51 @@ BOOST_AUTO_TEST_CASE(fetch_main_thread)
     }
 }
 
+// Test that StopFetching stops workers without clearing cached coins
+BOOST_AUTO_TEST_CASE(stop_fetching)
+{
+    const auto block{CreateBlock()};
+    CCoinsViewDB db{{.path = "", .cache_bytes = 1_MiB, .memory_only = true}, {}};
+    CCoinsViewCache main_cache{&db};
+    PopulateView(block, main_cache);
+    CoinsViewCacheAsync view{&main_cache};
+
+    // Start fetching and access a coin
+    view.StartFetching(block);
+    const auto& first_tx{block.vtx[1]};
+    const auto& first_coin{view.AccessCoin(first_tx->vin[0].prevout)};
+    BOOST_CHECK(!first_coin.IsSpent());
+    BOOST_CHECK_EQUAL(view.GetCacheSize(), 1);
+
+    // StopFetching should stop workers but preserve cached coin
+    view.StopFetching();
+    BOOST_CHECK_EQUAL(view.GetCacheSize(), 1);
+    BOOST_CHECK(!view.AccessCoin(first_tx->vin[0].prevout).IsSpent());
+
+    // StopFetching is idempotent
+    view.StopFetching();
+    BOOST_CHECK_EQUAL(view.GetCacheSize(), 1);
+
+    // Can start fetching again after StopFetching
+    view.StartFetching(block);
+    CheckCache(block, view);
+    view.Reset();
+}
+
+// Test StopFetching before any coins are accessed
+BOOST_AUTO_TEST_CASE(stop_fetching_early)
+{
+    const auto block{CreateBlock()};
+    CCoinsViewDB db{{.path = "", .cache_bytes = 1_MiB, .memory_only = true}, {}};
+    CCoinsViewCache main_cache{&db};
+    PopulateView(block, main_cache);
+    CoinsViewCacheAsync view{&main_cache};
+
+    // Start fetching then immediately stop
+    view.StartFetching(block);
+    view.StopFetching();
+    BOOST_CHECK_EQUAL(view.GetCacheSize(), 0);
+    CheckCache(block, view);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

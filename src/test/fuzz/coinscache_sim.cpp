@@ -411,7 +411,7 @@ FUZZ_TARGET(coinscache_sim, .init = setup_coinscache_sim)
             [&]() { // Remove a cache level.
                 // Apply to real caches (this reduces caches.size(), implicitly doing the same on the simulation data).
                 caches.back()->SanityCheck();
-                if (current_async_height == caches.size()) {
+                if (current_async_height > 0 && current_async_height == caches.size()) {
                     caches.back()->Reset();
                     g_async_cache.reset(static_cast<CoinsViewCacheAsync*>(caches.back().release()));
                     current_async_height = 0;
@@ -437,6 +437,12 @@ FUZZ_TARGET(coinscache_sim, .init = setup_coinscache_sim)
                 sim_caches[caches.size()].Wipe();
                 // Apply to real caches.
                 caches.back()->Reset();
+            },
+
+            [&]() { // StopFetching (only affects async cache).
+                if (current_async_height > 0 && current_async_height == caches.size()) {
+                    static_cast<CoinsViewCacheAsync*>(caches.back().get())->StopFetching();
+                }
             },
 
             [&]() { // GetCacheSize
