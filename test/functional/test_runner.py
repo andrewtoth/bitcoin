@@ -318,6 +318,7 @@ BASE_SCRIPTS = [
     'rpc_estimatefee.py',
     'p2p_private_broadcast.py',
     'p2p_private_broadcast_cap.py',
+    'p2p_private_broadcast_decoy.py',
     'rpc_getblockstats.py',
     'feature_port.py',
     'feature_bind_port_externalip.py',
