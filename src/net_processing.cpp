@@ -55,6 +55,7 @@
 #include <sync.h>
 #include <tinyformat.h>
 #include <txmempool.h>
+#include <util/feefrac.h>
 #include <uint256.h>
 #include <util/check.h>
 #include <util/strencodings.h>
@@ -201,8 +202,15 @@ static constexpr size_t MAX_ADDR_PROCESSING_TOKEN_BUCKET{MAX_ADDR_TO_SEND};
 static constexpr size_t NUM_PRIVATE_BROADCAST_PER_TX{3};
 /** Private broadcast connections must complete within this time. Disconnect the peer if it takes longer. */
 static constexpr auto PRIVATE_BROADCAST_MAX_CONNECTION_LIFETIME{3min};
-/** Average interval between private broadcast decoy attempts */
-static constexpr auto PRIVATE_BROADCAST_DECOY_INTERVAL{3h};
+/** Interval between private broadcast decoy attempts.
+ *  EXPERIMENT: fixed 2min (instead of an exponentially distributed 3h mean) to gather
+ *  selection-strategy statistics quickly. */
+static constexpr auto PRIVATE_BROADCAST_DECOY_INTERVAL{2min};
+/** EXPERIMENT: recency window for the decoy feerate walk. Only mempool entries that
+ *  arrived within this window are considered by the walk. Widened from 3s: with a
+ *  single tx-relay peer the 3s window was empty most of the time (txs arrive in
+ *  ~5s-average trickle batches), so the walk arm nearly always fell back. */
+static constexpr auto PRIVATE_BROADCAST_DECOY_WALK_WINDOW{10s};
 
 // Internal stuff
 namespace {
@@ -1199,8 +1207,57 @@ private:
 
     /// Whether the next private broadcast connection should be a decoy
     std::atomic_bool m_trigger_private_broadcast_decoy{false};
-    /// Decoy transaction state. Only written and accessed on msghand thread, so doesn't need synchronization.
-    std::pair<NodeId, CTransactionRef> m_private_broadcast_decoy_state{-1, nullptr};
+
+    /// EXPERIMENT: how the in-flight decoy transaction was selected.
+    enum class DecoySelection {
+        TOP_FALLBACK, //!< newest mempool entry (no >=1 sat/vB tx in the walk window)
+        GE1_WALK,     //!< newest entry with chunk feerate >= 1 sat/vB within PRIVATE_BROADCAST_DECOY_WALK_WINDOW
+    };
+
+    /// EXPERIMENT: protects the decoy state and statistics. Sends and GETDATAs happen on the
+    /// msghand thread, but outcomes are counted at disconnect in FinalizeNode (net thread).
+    mutable Mutex m_decoy_mutex;
+
+    /// In-flight decoy state, per node. Multiple decoy connections can be alive at once
+    /// (Tor connection setup can take longer than the decoy interval). An entry is added
+    /// when the decoy INV is sent and consumed in FinalizeNode.
+    struct DecoyState {
+        CTransactionRef tx{nullptr};
+        DecoySelection selection{DecoySelection::TOP_FALLBACK};
+        bool getdata_received{false};
+        NodeClock::time_point sent_at{};
+        std::string peer_ua{}; //!< the peer's sanitized user agent, captured at INV time
+    };
+    std::map<NodeId, DecoyState> m_decoy_states GUARDED_BY(m_decoy_mutex);
+
+    /// EXPERIMENT: cumulative decoy statistics. Attempts and getdatas are counted when the
+    /// decoy connection disconnects, so the rates are exact at every log line.
+    struct {
+        size_t attempts_top{0};      //!< finished decoys that fell back to top-of-mempool selection
+        size_t attempts_ge1{0};      //!< finished decoys that used a >=1 sat/vB walk pick
+        size_t getdata_top{0};       //!< top-of-mempool decoys that got a GETDATA
+        size_t getdata_ge1{0};       //!< >=1 sat/vB decoys that got a GETDATA
+        size_t window_no_ge1{0};     //!< walks that found no >=1 sat/vB tx in the window and fell back
+    } m_decoy_stats GUARDED_BY(m_decoy_mutex);
+
+    /// EXPERIMENT: result of decoy transaction selection.
+    struct DecoyCandidate {
+        CTransactionRef tx{nullptr};       //!< selected tx; nullptr if the mempool is empty
+        bool ge1_hit{false};               //!< true if the tx is a >=1 sat/vB pick from the window
+        size_t window_size{0};             //!< entries found in the recency window
+        std::chrono::seconds age{0};       //!< age of the selected tx (now - mempool entry time)
+        FeePerWeight chunk_feerate{};      //!< chunk feerate of the selected tx
+    };
+
+    /// EXPERIMENT: select a decoy transaction from the mempool: the newest entry within
+    /// PRIVATE_BROADCAST_DECOY_WALK_WINDOW whose chunk feerate is >= 1 sat/vB. Such txs are
+    /// relayable by all node versions, so a GETDATA for one cannot be explained by the peer
+    /// being fee-filtered from ever seeing it. Falls back to the newest entry if the window
+    /// has no such tx.
+    DecoyCandidate SelectDecoyTx() EXCLUSIVE_LOCKS_REQUIRED(m_mempool.cs);
+
+    /// EXPERIMENT: render cumulative decoy statistics for logging.
+    std::string DecoyStatsToString() const EXCLUSIVE_LOCKS_REQUIRED(m_decoy_mutex);
 };
 
 const CNodeState* PeerManagerImpl::State(NodeId pnode) const
@@ -1791,9 +1848,8 @@ void PeerManagerImpl::InitiatePrivateBroadcastDecoy(CScheduler& scheduler)
         m_connman.m_private_broadcast.NumToOpenAdd(1);
     }
 
-    const auto delta{std::chrono::duration_cast<std::chrono::milliseconds>(
-        FastRandomContext().rand_exp_duration(PRIVATE_BROADCAST_DECOY_INTERVAL))};
-    scheduler.scheduleFromNow([&] { InitiatePrivateBroadcastDecoy(scheduler); }, delta);
+    // EXPERIMENT: fixed interval (no exponential jitter) for regular sampling.
+    scheduler.scheduleFromNow([&] { InitiatePrivateBroadcastDecoy(scheduler); }, PRIVATE_BROADCAST_DECOY_INTERVAL);
 }
 
 void PeerManagerImpl::FinalizeNode(const CNode& node)
@@ -1873,6 +1929,28 @@ void PeerManagerImpl::FinalizeNode(const CNode& node)
         // If we didn't complete the handshake, we never reset the trigger. Do it here.
         if (!node.fSuccessfullyConnected) {
             m_trigger_private_broadcast_decoy = false;
+        }
+        // EXPERIMENT: the decoy connection is done (PONG received, timed out, or dropped);
+        // count and log its outcome. This covers both success and failure paths.
+        LOCK(m_decoy_mutex);
+        if (auto it{m_decoy_states.find(nodeid)}; it != m_decoy_states.end()) {
+            const DecoyState& decoy{it->second};
+            const bool was_ge1{decoy.selection == DecoySelection::GE1_WALK};
+            if (was_ge1) {
+                ++m_decoy_stats.attempts_ge1;
+                if (decoy.getdata_received) ++m_decoy_stats.getdata_ge1;
+            } else {
+                ++m_decoy_stats.attempts_top;
+                if (decoy.getdata_received) ++m_decoy_stats.getdata_top;
+            }
+            LogInfo("privbcast decoy stats: disconnect type=%s outcome=%s duration_s=%d txid=%s ua=%s | totals: %s",
+                    was_ge1 ? "ge1" : "top",
+                    decoy.getdata_received ? "getdata" : "no_getdata",
+                    count_seconds(std::chrono::duration_cast<std::chrono::seconds>(NodeClock::now() - decoy.sent_at)),
+                    decoy.tx->GetHash().ToString(),
+                    decoy.peer_ua.empty() ? "<none>" : decoy.peer_ua,
+                    DecoyStatsToString());
+            m_decoy_states.erase(it);
         }
     }
     LogDebug(BCLog::NET, "Cleared nodestate for peer=%d\n", nodeid);
@@ -2189,9 +2267,8 @@ void PeerManagerImpl::StartScheduledTasks(CScheduler& scheduler)
     const auto delta = 10min + FastRandomContext().randrange<std::chrono::milliseconds>(5min);
     scheduler.scheduleFromNow([&] { ReattemptInitialBroadcast(scheduler); }, delta);
 
-    const auto decoy_delta{std::chrono::duration_cast<std::chrono::milliseconds>(
-        FastRandomContext().rand_exp_duration(PRIVATE_BROADCAST_DECOY_INTERVAL))};
-    scheduler.scheduleFromNow([&] { InitiatePrivateBroadcastDecoy(scheduler); }, decoy_delta);
+    // EXPERIMENT: fixed interval (no exponential jitter) for regular sampling.
+    scheduler.scheduleFromNow([&] { InitiatePrivateBroadcastDecoy(scheduler); }, PRIVATE_BROADCAST_DECOY_INTERVAL);
     if (m_opts.private_broadcast) {
         scheduler.scheduleFromNow([&] { ReattemptPrivateBroadcast(scheduler); }, 0min);
     }
@@ -3814,18 +3891,95 @@ void PeerManagerImpl::LogBlockHeader(const CBlockIndex& index, const CNode& peer
     }
 }
 
+PeerManagerImpl::DecoyCandidate PeerManagerImpl::SelectDecoyTx()
+{
+    AssertLockHeld(m_mempool.cs);
+    const auto& entry_time_index{m_mempool.mapTx.get<entry_time>()};
+    const auto now{GetTime<std::chrono::seconds>()};
+
+    // 1 sat/vB == 1 sat per 4 weight units.
+    const auto at_least_1sat_vb{[](const FeePerWeight& rate) {
+        return rate.size > 0 && rate.fee * 4 >= rate.size;
+    }};
+
+    size_t window_size{0};
+    const CTxMemPoolEntry* pick{nullptr};
+    FeePerWeight pick_rate;
+    // Iterate newest to oldest; the first >=1 sat/vB entry is the newest such tx.
+    // Keep iterating afterwards only to count the full window size.
+    for (auto it = entry_time_index.rbegin(); it != entry_time_index.rend(); ++it) {
+        if (now - it->GetTime() > PRIVATE_BROADCAST_DECOY_WALK_WINDOW) break;
+        ++window_size;
+        if (pick == nullptr) {
+            const auto rate{m_mempool.GetMainChunkFeerate(*it)};
+            if (at_least_1sat_vb(rate)) {
+                pick = &*it;
+                pick_rate = rate;
+            }
+        }
+    }
+    if (pick != nullptr) {
+        return {.tx = pick->GetSharedTx(),
+                .ge1_hit = true,
+                .window_size = window_size,
+                .age = now - pick->GetTime(),
+                .chunk_feerate = pick_rate};
+    }
+    const auto newest{entry_time_index.rbegin()};
+    if (newest != entry_time_index.rend()) {
+        return {.tx = newest->GetSharedTx(),
+                .window_size = window_size,
+                .age = now - newest->GetTime(),
+                .chunk_feerate = m_mempool.GetMainChunkFeerate(*newest)};
+    }
+    return {.window_size = window_size};
+}
+
+std::string PeerManagerImpl::DecoyStatsToString() const
+{
+    AssertLockHeld(m_decoy_mutex);
+    const auto rate{[](size_t getdata, size_t attempts) {
+        return attempts == 0 ? 0.0 : 100.0 * getdata / attempts;
+    }};
+    return strprintf("ge1=%d/%d (%.1f%%) top=%d/%d (%.1f%%) window_no_ge1=%d",
+                     m_decoy_stats.getdata_ge1, m_decoy_stats.attempts_ge1,
+                     rate(m_decoy_stats.getdata_ge1, m_decoy_stats.attempts_ge1),
+                     m_decoy_stats.getdata_top, m_decoy_stats.attempts_top,
+                     rate(m_decoy_stats.getdata_top, m_decoy_stats.attempts_top),
+                     m_decoy_stats.window_no_ge1);
+}
+
 void PeerManagerImpl::PushPrivateBroadcastTx(CNode& node)
 {
     Assume(node.IsPrivateBroadcastConn());
 
     std::optional<CTransactionRef> opt_tx{};
     if (m_trigger_private_broadcast_decoy.exchange(false)) {
-        LOCK(m_mempool.cs);
-        const auto& entry_time_index{m_mempool.mapTx.get<entry_time>()};
-        const auto last_entry_inserted{entry_time_index.rbegin()};
-        if (last_entry_inserted != entry_time_index.rend()) {
-            opt_tx = last_entry_inserted->GetSharedTx();
-            m_private_broadcast_decoy_state = std::make_pair(node.GetId(), *opt_tx);
+        DecoyCandidate candidate;
+        {
+            LOCK(m_mempool.cs);
+            candidate = SelectDecoyTx();
+        }
+        if (candidate.tx) {
+            // Attempts are counted at disconnect (FinalizeNode), not here.
+            const double feerate_sat_vb{candidate.chunk_feerate.size > 0 ? 4.0 * candidate.chunk_feerate.fee / candidate.chunk_feerate.size : 0.0};
+            const std::string peer_ua{WITH_LOCK(node.m_subver_mutex, return node.cleanSubVer)};
+            {
+                LOCK(m_decoy_mutex);
+                if (!candidate.ge1_hit) ++m_decoy_stats.window_no_ge1;
+                m_decoy_states[node.GetId()] = DecoyState{
+                    .tx = candidate.tx,
+                    .selection = candidate.ge1_hit ? DecoySelection::GE1_WALK : DecoySelection::TOP_FALLBACK,
+                    .getdata_received = false,
+                    .sent_at = NodeClock::now(),
+                    .peer_ua = peer_ua,
+                };
+            }
+            LogInfo("privbcast decoy stats: send type=%s window_txs=%d age_s=%d feerate_sat_vb=%.2f txid=%s ua=%s",
+                    candidate.ge1_hit ? "ge1" : "top", candidate.window_size, count_seconds(candidate.age),
+                    feerate_sat_vb, candidate.tx->GetHash().ToString(),
+                    peer_ua.empty() ? "<none>" : peer_ua);
+            opt_tx = candidate.tx;
         }
     }
     if (!opt_tx) {
@@ -4472,8 +4626,13 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
 
         if (pfrom.IsPrivateBroadcastConn()) {
             auto pushed_tx_opt{m_tx_for_private_broadcast.GetTxForNode(pfrom.GetId())};
-            if (!pushed_tx_opt && m_private_broadcast_decoy_state.first == pfrom.GetId()) {
-                pushed_tx_opt = m_private_broadcast_decoy_state.second;
+            if (!pushed_tx_opt) {
+                // EXPERIMENT: remember the GETDATA; it is counted and logged at disconnect.
+                LOCK(m_decoy_mutex);
+                if (auto it{m_decoy_states.find(pfrom.GetId())}; it != m_decoy_states.end()) {
+                    pushed_tx_opt = it->second.tx;
+                    it->second.getdata_received = true;
+                }
             }
             if (!pushed_tx_opt) {
                 LogDebug(BCLog::PRIVBROADCAST, "Disconnecting: got GETDATA without sending an INV, %s",
