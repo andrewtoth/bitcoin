@@ -104,6 +104,11 @@ inline TxHashKeyPrefix CreateKeyPrefix(const SipHasher13UJ& hasher, const Txid& 
     return hasher.Hash(txid.ToUint256()) >> (8 * (sizeof(TxHashKeyPrefix) - HASH_PREFIX_SIZE));
 }
 
+inline TxHashKeyPrefix CreateKeyPrefix(const SipHasher13UJ& hasher, const uint256& hash, uint64_t extra)
+{
+    return hasher.Hash(hash, extra) >> (8 * (sizeof(TxHashKeyPrefix) - HASH_PREFIX_SIZE));
+}
+
 struct DBKey {
     TxHashKeyPrefix hash_prefix{0};
     BlockTxPosition pos;

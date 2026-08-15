@@ -4,38 +4,44 @@
 
 #include <index/txospenderindex.h>
 
+#include <chain.h>
 #include <common/args.h>
 #include <crypto/siphash.h>
 #include <dbwrapper.h>
 #include <flatfile.h>
 #include <index/base.h>
 #include <index/disktxpos.h>
+#include <index/txindex_key.h>
 #include <interfaces/chain.h>
-#include <logging.h>
 #include <node/blockstorage.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
 #include <random.h>
 #include <serialize.h>
 #include <streams.h>
+#include <sync.h>
 #include <tinyformat.h>
 #include <uint256.h>
 #include <util/fs.h>
+#include <util/log.h>
 #include <validation.h>
 
-#include <cstddef>
-#include <cstdio>
+#include <cassert>
+#include <cstdint>
 #include <exception>
 #include <ios>
-#include <span>
+#include <memory>
+#include <optional>
 #include <string>
 #include <utility>
-#include <vector>
 
 /* The database is used to find the spending transaction of a given utxo.
- * For every input of every transaction it stores a key that is a pair(siphash(input outpoint), transaction location on disk) and a zero-byte value.
- * To find the spending transaction of an outpoint, we perform a range query on siphash(outpoint), and for each returned key load the transaction
- * and return it if it does spend the provided outpoint.
+ * New entries store a compact key reused from txindex:
+ *   ['x', 5-byte siphash(outpoint), varint height, 3-byte tx offset] -> (empty)
+ * Lookups seek the hash prefix and, because reorged blocks are deleted, treat
+ * the packed sequence number as the spending block's height.
+ * Legacy entries remain readable:
+ *   ['s', 8-byte siphash(outpoint), CDiskTxPos] -> (empty)
  */
 
 // LevelDB key prefix. We only have one key for now but it will make it easier to add others if needed.
@@ -43,13 +49,25 @@ constexpr uint8_t DB_TXOSPENDERINDEX{'s'};
 
 std::unique_ptr<TxoSpenderIndex> g_txospenderindex;
 
-struct DBKey {
+namespace {
+SipHasher13UJ ReadOrCreateHasher(CDBWrapper& db)
+{
+    std::pair<uint64_t, uint64_t> salt;
+    if (!db.Read(txindex::DB_TXID_HASH_SALT, salt)) {
+        FastRandomContext rng(false);
+        salt = {rng.rand64(), rng.rand64()};
+        db.Write(txindex::DB_TXID_HASH_SALT, salt, /*fSync=*/true);
+    }
+    return SipHasher13UJ{salt.first, salt.second};
+}
+
+struct LegacyDBKey {
     uint64_t hash;
     CDiskTxPos pos;
 
-    explicit DBKey(const uint64_t& hash_in, const CDiskTxPos& pos_in) : hash(hash_in), pos(pos_in) {}
+    explicit LegacyDBKey(const uint64_t& hash_in, const CDiskTxPos& pos_in) : hash(hash_in), pos(pos_in) {}
 
-    SERIALIZE_METHODS(DBKey, obj)
+    SERIALIZE_METHODS(LegacyDBKey, obj)
     {
         uint8_t prefix{DB_TXOSPENDERINDEX};
         READWRITE(prefix);
@@ -60,14 +78,49 @@ struct DBKey {
         READWRITE(obj.pos);
     }
 };
+} // namespace
+
+/** Access to the txospenderindex database (indexes/txospenderindex/db) */
+class TxoSpenderIndex::DB : public BaseIndex::DB
+{
+public:
+    explicit DB(size_t n_cache_size, bool f_memory = false, bool f_wipe = false);
+
+    const SipHasher13UJ m_hasher;
+
+    CBlockLocator ReadBestBlock() const override;
+    void WriteBestBlock(CDBBatch& batch, const CBlockLocator& locator) override;
+};
+
+static fs::path TxoSpenderIndexDBPath() { return gArgs.GetDataDirNet() / "indexes" / "txospenderindex" / "db"; }
+
+TxoSpenderIndex::DB::DB(size_t n_cache_size, bool f_memory, bool f_wipe) :
+    BaseIndex::DB(TxoSpenderIndexDBPath(), n_cache_size, f_memory, f_wipe, /*f_obfuscate=*/false, /*f_bloom=*/false),
+    m_hasher{ReadOrCreateHasher(*this)}
+{}
+
+CBlockLocator TxoSpenderIndex::DB::ReadBestBlock() const
+{
+    CBlockLocator locator;
+    if (Read(txindex::DB_BEST_BLOCK_V2, locator)) {
+        return locator;
+    }
+    return BaseIndex::DB::ReadBestBlock();
+}
+
+void TxoSpenderIndex::DB::WriteBestBlock(CDBBatch& batch, const CBlockLocator& locator)
+{
+    batch.Write(txindex::DB_BEST_BLOCK_V2, locator);
+}
 
 TxoSpenderIndex::TxoSpenderIndex(std::unique_ptr<interfaces::Chain> chain, size_t n_cache_size, bool f_memory, bool f_wipe)
-    : BaseIndex(std::move(chain), "txospenderindex", "txospenderidx"), m_db{std::make_unique<DB>(gArgs.GetDataDirNet() / "indexes" / "txospenderindex" / "db", n_cache_size, f_memory, f_wipe, /*f_obfuscate=*/false, /*f_bloom=*/false)}
+    : BaseIndex(std::move(chain), "txospenderindex", "txospenderidx"), m_db{std::make_unique<DB>(n_cache_size, f_memory, f_wipe)}
 {
-    if (!m_db->Read("siphash_key", m_siphash_key)) {
-        FastRandomContext rng(false);
-        m_siphash_key = {rng.rand64(), rng.rand64()};
-        m_db->Write("siphash_key", m_siphash_key, /*fSync=*/ true);
+    if (m_db->Read("siphash_key", m_siphash_key)) {
+        m_has_legacy = true;
+        LogInfo("txospenderindex contains entries in the legacy format, which uses excessive disk space. "
+                "To reclaim disk space, stop the node, delete %s and restart to rebuild the index.",
+                fs::PathToString(TxoSpenderIndexDBPath()));
     }
 }
 
@@ -78,72 +131,78 @@ interfaces::Chain::NotifyOptions TxoSpenderIndex::CustomOptions()
     return options;
 }
 
-static uint64_t CreateKeyPrefix(std::pair<uint64_t, uint64_t> siphash_key, const COutPoint& vout)
+namespace {
+txindex::TxHashKeyPrefix CreateHashedPrefix(const SipHasher13UJ& hasher, const COutPoint& outpoint)
 {
-    return PresaltedSipHasher(siphash_key.first, siphash_key.second)(vout.hash.ToUint256(), vout.n);
+    return txindex::CreateKeyPrefix(hasher, outpoint.hash.ToUint256(), outpoint.n);
 }
 
-static DBKey CreateKey(std::pair<uint64_t, uint64_t> siphash_key, const COutPoint& vout, const CDiskTxPos& pos)
+uint64_t CreateLegacyPrefix(const std::pair<uint64_t, uint64_t>& salt, const COutPoint& outpoint)
 {
-    return DBKey(CreateKeyPrefix(siphash_key, vout), pos);
+    return PresaltedSipHasher(salt.first, salt.second)(outpoint.hash.ToUint256(), outpoint.n);
 }
 
-void TxoSpenderIndex::WriteSpenderInfos(const std::vector<std::pair<COutPoint, CDiskTxPos>>& items)
+template <typename Fn>
+void ForEachSpend(const interfaces::BlockInfo& block, Fn&& fn)
 {
-    CDBBatch batch(*m_db);
-    for (const auto& [outpoint, pos] : items) {
-        DBKey key(CreateKey(m_siphash_key, outpoint, pos));
-        // The key encodes the spent outpoint hash and disk position. The value is only a marker.
-        // Older entries may contain serialized empty strings; FindSpender() reads only keys.
-        batch.Write(key, std::span<const std::byte>{});
-    }
-    m_db->WriteBatch(batch);
-}
-
-
-void TxoSpenderIndex::EraseSpenderInfos(const std::vector<std::pair<COutPoint, CDiskTxPos>>& items)
-{
-    CDBBatch batch(*m_db);
-    for (const auto& [outpoint, pos] : items) {
-        batch.Erase(CreateKey(m_siphash_key, outpoint, pos));
-    }
-    m_db->WriteBatch(batch);
-}
-
-static std::vector<std::pair<COutPoint, CDiskTxPos>> BuildSpenderPositions(const interfaces::BlockInfo& block)
-{
-    std::vector<std::pair<COutPoint, CDiskTxPos>> items;
-    items.reserve(block.data->vtx.size());
-
-    CDiskTxPos pos({block.file_number, block.data_pos}, GetSizeOfCompactSize(block.data->vtx.size()));
+    assert(block.data);
+    assert(block.height >= 0);
+    const uint32_t tx_count_size{static_cast<uint32_t>(GetSizeOfCompactSize(block.data->vtx.size()))};
+    uint32_t tx_offset_in_block{txindex::BLOCK_HEADER_SIZE + tx_count_size};
+    uint32_t tx_offset_after_header{tx_count_size};
     for (const auto& tx : block.data->vtx) {
         if (!tx->IsCoinBase()) {
+            const txindex::BlockTxPosition hashed_pos{static_cast<uint32_t>(block.height), tx_offset_in_block};
+            const CDiskTxPos legacy_pos{{block.file_number, block.data_pos}, tx_offset_after_header};
             for (const auto& input : tx->vin) {
-                items.emplace_back(input.prevout, pos);
+                fn(input.prevout, hashed_pos, legacy_pos);
             }
         }
-        pos.nTxOffset += ::GetSerializeSize(TX_WITH_WITNESS(*tx));
+        const uint32_t tx_size{tx->ComputeTotalSize()};
+        tx_offset_in_block += tx_size;
+        tx_offset_after_header += tx_size;
     }
+}
+} // namespace
 
-    return items;
+void TxoSpenderIndex::WriteSpenders(const interfaces::BlockInfo& block)
+{
+    CDBBatch batch(*m_db);
+    ForEachSpend(block, [&](const COutPoint& outpoint, const txindex::BlockTxPosition& hashed_pos, const CDiskTxPos&) {
+        batch.Write(txindex::DBKey{CreateHashedPrefix(m_db->m_hasher, outpoint), hashed_pos}, txindex::EMPTY_VALUE);
+    });
+    m_db->WriteBatch(batch);
 }
 
+void TxoSpenderIndex::EraseSpenders(const interfaces::BlockInfo& block)
+{
+    CDBBatch batch(*m_db);
+    ForEachSpend(block, [&](const COutPoint& outpoint, const txindex::BlockTxPosition& hashed_pos, const CDiskTxPos& legacy_pos) {
+        batch.Erase(txindex::DBKey{CreateHashedPrefix(m_db->m_hasher, outpoint), hashed_pos});
+        if (m_has_legacy) {
+            batch.Erase(LegacyDBKey{CreateLegacyPrefix(m_siphash_key, outpoint), legacy_pos});
+        }
+    });
+    m_db->WriteBatch(batch);
+}
+
+TxoSpenderIndex::~TxoSpenderIndex() = default;
 
 bool TxoSpenderIndex::CustomAppend(const interfaces::BlockInfo& block)
 {
-    WriteSpenderInfos(BuildSpenderPositions(block));
+    WriteSpenders(block);
     return true;
 }
 
 bool TxoSpenderIndex::CustomRemove(const interfaces::BlockInfo& block)
 {
-    EraseSpenderInfos(BuildSpenderPositions(block));
+    EraseSpenders(block);
     return true;
 }
 
-util::Expected<TxoSpender, std::string> TxoSpenderIndex::ReadTransaction(const CDiskTxPos& tx_pos) const
+util::Expected<TxoSpender, std::string> ReadLegacyTransaction(Chainstate& chainstate, const CDiskTxPos& tx_pos)
 {
-    AutoFile file{m_chainstate->m_blockman.OpenBlockFile(tx_pos, /*fReadOnly=*/true)};
+    AutoFile file{chainstate.m_blockman.OpenBlockFile(tx_pos, /*fReadOnly=*/true)};
     if (file.IsNull()) {
         return util::Unexpected("cannot open block");
     }
@@ -160,16 +219,16 @@ util::Expected<TxoSpender, std::string> TxoSpenderIndex::ReadTransaction(const C
     }
 }
 
-util::Expected<std::optional<TxoSpender>, std::string> TxoSpenderIndex::FindSpender(const COutPoint& txo) const
+util::Expected<std::optional<TxoSpender>, std::string> TxoSpenderIndex::FindLegacySpender(const COutPoint& txo) const
 {
-    const uint64_t prefix{CreateKeyPrefix(m_siphash_key, txo)};
+    const uint64_t prefix{CreateLegacyPrefix(m_siphash_key, txo)};
     std::unique_ptr<CDBIterator> it(m_db->NewIterator());
-    DBKey key(prefix, CDiskTxPos());
+    LegacyDBKey key(prefix, CDiskTxPos());
 
     // find all keys that start with the outpoint hash, load the transaction at the location specified in the key
     // and return it if it does spend the provided outpoint
     for (it->Seek(std::pair{DB_TXOSPENDERINDEX, prefix}); it->Valid() && it->GetKey(key) && key.hash == prefix; it->Next()) {
-        if (const auto spender{ReadTransaction(key.pos)}) {
+        if (const auto spender{ReadLegacyTransaction(*m_chainstate, key.pos)}) {
             for (const auto& input : spender->tx->vin) {
                 if (input.prevout == txo) {
                     return std::optional{*spender};
@@ -181,6 +240,46 @@ util::Expected<std::optional<TxoSpender>, std::string> TxoSpenderIndex::FindSpen
         }
     }
     return util::Expected<std::optional<TxoSpender>, std::string>(std::nullopt);
+}
+
+util::Expected<std::optional<TxoSpender>, std::string> TxoSpenderIndex::FindSpender(const COutPoint& txo) const
+{
+    const txindex::TxHashKeyPrefix prefix{CreateHashedPrefix(m_db->m_hasher, txo)};
+    std::unique_ptr<CDBIterator> it{m_db->NewIterator()};
+    txindex::DBKey key{prefix, {}};
+    for (it->Seek(key); it->Valid() && it->GetKey(key) && key.hash_prefix == prefix; it->Next()) {
+        FlatFilePos tx_position;
+        uint256 block_hash;
+        {
+            LOCK(cs_main);
+            const CBlockIndex* block_index{m_chainstate->m_chain[key.pos.block_seq]};
+            if (!block_index) {
+                LogWarning("Block at height %u not found for outpoint %s:%d", key.pos.block_seq, txo.hash.GetHex(), txo.n);
+                continue;
+            }
+            if (!(block_index->nStatus & BLOCK_HAVE_DATA)) continue;
+            tx_position = {block_index->nFile, block_index->nDataPos + key.pos.tx_offset_in_block};
+            block_hash = block_index->GetBlockHash();
+        }
+        AutoFile file{m_chainstate->m_blockman.OpenBlockFile(tx_position, /*fReadOnly=*/true)};
+        if (file.IsNull()) {
+            LogWarning("OpenBlockFile failed for outpoint %s:%d", txo.hash.GetHex(), txo.n);
+            continue;
+        }
+        CTransactionRef tx;
+        try {
+            file >> TX_WITH_WITNESS(tx);
+        } catch (const std::exception& e) {
+            LogWarning("Deserialize or I/O error - %s", e.what());
+            continue;
+        }
+        for (const auto& input : tx->vin) {
+            if (input.prevout == txo) {
+                return std::optional{TxoSpender{std::move(tx), block_hash}};
+            }
+        }
+    }
+    return m_has_legacy ? FindLegacySpender(txo) : util::Expected<std::optional<TxoSpender>, std::string>(std::nullopt);
 }
 
 BaseIndex::DB& TxoSpenderIndex::GetDB() const { return *m_db; }
