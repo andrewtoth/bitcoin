@@ -63,6 +63,7 @@ namespace kernel {
 struct ChainstateRole;
 } // namespace kernel
 namespace node {
+class BlockPrefetcher;
 class SnapshotMetadata;
 } // namespace node
 namespace Consensus {
@@ -553,8 +554,6 @@ enum class Assumeutxo {
 class Chainstate
 {
 protected:
-    class BlockFetcher;
-
     /**
      * The ChainState Mutex
      * A lock that must be held when modifying this ChainState - held in ActivateBestChain() and
@@ -563,7 +562,7 @@ protected:
     Mutex m_chainstate_mutex;
 
     //! Reads blocks ahead during chain activation.
-    std::unique_ptr<BlockFetcher> m_block_fetcher;
+    std::unique_ptr<node::BlockPrefetcher> m_block_fetcher;
 
     //! Optional mempool that is kept in sync with the chain.
     //! Only the active chainstate has a mempool.

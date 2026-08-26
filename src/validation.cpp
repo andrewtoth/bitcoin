@@ -29,6 +29,7 @@
 #include <kernel/types.h>
 #include <kernel/warning.h>
 #include <logging/timer.h>
+#include <node/blockprefetch.h>
 #include <node/blockstorage.h>
 #include <node/utxo_snapshot.h>
 #include <policy/ephemeral_policy.h>
@@ -3191,66 +3192,12 @@ void Chainstate::PruneBlockIndexCandidates() {
     assert(!setBlockIndexCandidates.empty());
 }
 
-/** Supplies blocks to validation. Destruction waits for any queued reads. */
-class Chainstate::BlockFetcher
-{
-    static constexpr uint32_t QUEUE_SIZE{2};
-
-    const BlockManager& m_blockman;
-    ThreadPool m_pool{"blockread"};
-    std::deque<std::future<std::shared_ptr<const CBlock>>> m_followups GUARDED_BY(::cs_main);
-
-    static bool ShouldEnqueue(const CBlockIndex* index) EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
-    {
-        return index && (index->nStatus & BLOCK_HAVE_DATA);
-    }
-
-    std::shared_ptr<const CBlock> PopFollowup() EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
-    {
-        if (m_followups.empty()) return nullptr;
-        auto followup{std::move(m_followups[0])};
-        m_followups.pop_front();
-        return followup.get();
-    }
-
-    bool Enqueue(const CBlockIndex& index) EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
-    {
-        if (m_pool.WorkersCount() == 0) m_pool.Start(1);
-        auto followup{m_pool.Submit([&blockman = m_blockman, hash = index.GetBlockHash(), pos = index.GetBlockPos()]() -> std::shared_ptr<const CBlock> {
-            if (auto block{std::make_shared<CBlock>()}; blockman.ReadBlock(*block, pos, hash)) return block;
-            return nullptr;
-        })};
-        if (followup) m_followups.emplace_back(std::move(*followup));
-        return !!followup;
-    }
-
-public:
-    explicit BlockFetcher(const BlockManager& blockman) : m_blockman{blockman} {}
-
-    void Clear() EXCLUSIVE_LOCKS_REQUIRED(::cs_main) { m_followups.clear(); }
-
-    std::shared_ptr<const CBlock> Load(const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
-    {
-        if (auto block{PopFollowup()}; block && block->GetHash() == hash) return block;
-        return nullptr;
-    }
-
-    void FillQueue(const CBlockIndex& last_index, int next_height) EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
-    {
-        AssertLockHeld(::cs_main);
-        for (size_t i{m_followups.size()}; i < QUEUE_SIZE; ++i) {
-            const auto* next{last_index.GetAncestor(next_height + i)};
-            if (!ShouldEnqueue(next) || !Enqueue(*next)) break;
-        }
-    }
-};
-
 Chainstate::Chainstate(
     CTxMemPool* mempool,
     BlockManager& blockman,
     ChainstateManager& chainman,
     std::optional<uint256> from_snapshot_blockhash)
-    : m_block_fetcher{std::make_unique<BlockFetcher>(blockman)},
+    : m_block_fetcher{std::make_unique<node::BlockPrefetcher>(blockman)},
       m_mempool(mempool),
       m_blockman(blockman),
       m_chainman(chainman),

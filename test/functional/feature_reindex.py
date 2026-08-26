@@ -9,6 +9,7 @@
 - Stop the node and restart it with -reindex-chainstate. Verify that the node has reindexed up to block 3.
 - Verify that out-of-order blocks are correctly processed, see LoadExternalBlockFile()
 - Verify that the first block on a competing fork is prefetched during a reorg.
+- Verify that optional indexes start a read-ahead worker while catching up.
 """
 
 from test_framework.blocktools import create_block
@@ -138,6 +139,14 @@ class ReindexTest(BitcoinTestFramework):
             assert_equal(debug_log.read().count('Using cached block'), 2)
         assert_equal(node.getbestblockhash(), fork_tip.hash_hex)
 
+    def index_prefetch(self):
+        self.log.info("Test index catch-up prefetches blocks")
+        node = self.nodes[0]
+        self.stop_node(0)
+        with node.assert_debug_log(expected_msgs=["txidx.00 thread start", "blkfltbscidx.00 thread start"]):
+            self.start_node(0, extra_args=["-txindex", "-blockfilterindex"])
+        self.restart_node(0)
+
     def run_test(self):
         self.reindex(False)
         self.reindex(True)
@@ -146,6 +155,7 @@ class ReindexTest(BitcoinTestFramework):
 
         self.out_of_order()
         self.reorg()
+        self.index_prefetch()
         self.continue_reindex_after_shutdown()
 
 

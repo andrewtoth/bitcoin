@@ -11,6 +11,7 @@
 #include <interfaces/types.h>
 #include <kernel/types.h>
 #include <node/abort.h>
+#include <node/blockprefetch.h>
 #include <node/blockstorage.h>
 #include <node/context.h>
 #include <node/database_args.h>
@@ -209,6 +210,7 @@ void BaseIndex::Sync()
 {
     const CBlockIndex* pindex = m_best_block_index.load();
     if (!m_synced) {
+        node::BlockPrefetcher fetcher{m_chainstate->m_blockman, m_thread_name};
         auto last_log_time{NodeClock::now()};
         auto last_locator_write_time{last_log_time};
         while (true) {
@@ -243,14 +245,23 @@ void BaseIndex::Sync()
                     break;
                 }
             }
-            if (pindex_next->pprev != pindex && !Rewind(pindex, pindex_next->pprev)) {
-                FatalErrorf("Failed to rewind %s to a previous chain tip", GetName());
-                return;
+            if (pindex_next->pprev != pindex) {
+                WITH_LOCK(::cs_main, fetcher.Clear());
+                if (!Rewind(pindex, pindex_next->pprev)) {
+                    FatalErrorf("Failed to rewind %s to a previous chain tip", GetName());
+                    return;
+                }
             }
             pindex = pindex_next;
 
-
-            if (!ProcessBlock(pindex)) return; // error logged internally
+            std::shared_ptr<const CBlock> loaded;
+            WITH_LOCK(::cs_main, {
+                loaded = fetcher.Load(pindex->GetBlockHash());
+                if (const auto* tip{m_chainstate->m_chain.Tip()}) {
+                    fetcher.FillQueue(*tip, pindex->nHeight + 1);
+                }
+            });
+            if (!ProcessBlock(pindex, loaded.get())) return; // error logged internally
 
             auto current_time{NodeClock::now()};
             if (current_time - last_log_time >= SYNC_LOG_INTERVAL) {
