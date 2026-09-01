@@ -22,6 +22,7 @@
 #include <util/string.h>
 #include <util/strencodings.h>
 #include <util/translation.h>
+#include <util/vector.h>
 
 void AddInputs(CMutableTransaction& rawTx, const UniValue& inputs_in, std::optional<bool> rbf)
 {
@@ -428,9 +429,12 @@ std::vector<RPCResult> TxDoc(const TxDocOptions& opts)
                     {RPCResult::Type::NUM, "n", "index"},
                     {RPCResult::Type::OBJ, "scriptPubKey", "", ScriptPubKeyDoc()},
                 },
-                opts.wallet ?
-                    std::vector<RPCResult>{{RPCResult::Type::BOOL, "ischange", /*optional=*/true, "Output script is change (only present if true)"}} :
-                    std::vector<RPCResult>{}
+                Cat(
+                    opts.wallet ?
+                        std::vector<RPCResult>{{RPCResult::Type::BOOL, "ischange", /*optional=*/true, "Output script is change (only present if true)"}} :
+                        std::vector<RPCResult>{},
+                    opts.extra_vout
+                )
             )},
         }},
     };

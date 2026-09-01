@@ -87,6 +87,8 @@ struct TxDocOptions {
     std::optional<std::string> fee_doc{};
     /// Elide vin inner fields but keep vin array with prevout expanded.
     std::optional<std::string> vin_inner_elision{};
+    /// Extra fields appended to each vout object (e.g. spentness annotations).
+    std::vector<RPCResult> extra_vout{};
 };
 /** Explain the UniValue "decoded" transaction object, may include extra fields if processed by wallet **/
 std::vector<RPCResult> TxDoc(const TxDocOptions& opts = {});
