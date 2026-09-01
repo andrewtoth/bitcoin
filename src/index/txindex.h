@@ -42,7 +42,7 @@ private:
     friend class txindex_tests::TxIndexTest;
     const std::unique_ptr<DB> m_db;
 
-    bool AllowPrune() const override { return false; }
+    bool AllowPrune() const override;
 
     /// Look up a transaction among the legacy (full-txid) entries.
     std::optional<TxIndexResult> FindLegacyTx(const Txid& tx_hash) const;
@@ -58,6 +58,9 @@ public:
 
     // Destructor is declared because this class contains a unique_ptr to an incomplete type.
     virtual ~TxIndex() override;
+
+    //! True if the on-disk database still contains pre-hashing ('t' prefix) entries.
+    bool HasLegacyEntries() const;
 
     /// Look up a transaction by hash.
     ///

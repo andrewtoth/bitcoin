@@ -958,9 +958,9 @@ static RPCMethod gettxspendingprevout()
                 {
                     {RPCResult::Type::STR_HEX, "txid", "the transaction id of the checked output"},
                     {RPCResult::Type::NUM, "vout", "the vout value of the checked output"},
-                    {RPCResult::Type::STR_HEX, "spendingtxid", /*optional=*/true, "the transaction id of the mempool transaction spending this output (omitted if unspent)"},
-                    {RPCResult::Type::STR_HEX, "spendingtx", /*optional=*/true, "the transaction spending this output (only if return_spending_tx is set, omitted if unspent)"},
-                    {RPCResult::Type::STR_HEX, "blockhash", /*optional=*/true, "the hash of the spending block (omitted if unspent or the spending tx is not confirmed)"},
+                    {RPCResult::Type::STR_HEX, "spendingtxid", /*optional=*/true, "the transaction id of the transaction spending this output (omitted if unspent, or if the spending block has been pruned)"},
+                    {RPCResult::Type::STR_HEX, "spendingtx", /*optional=*/true, "the transaction spending this output (only if return_spending_tx is set, omitted if unspent or if the spending block has been pruned)"},
+                    {RPCResult::Type::STR_HEX, "blockhash", /*optional=*/true, "the hash of the spending block (omitted if unspent or the spending tx is not confirmed). Present without spendingtxid if the spending block has been pruned"},
                 }},
             }
         },
