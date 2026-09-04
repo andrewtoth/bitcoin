@@ -24,6 +24,7 @@ ALL_INDEX_ARGS = [
     '-blockfilterindex=1',
     '-coinstatsindex=1',
     '-txospenderindex=1',
+    '-scriptpubkeyindex=1',
 ]
 
 class InitTest(BitcoinTestFramework):
@@ -151,6 +152,11 @@ class InitTest(BitcoinTestFramework):
                 'error_message': 'LevelDB error: Corruption: CURRENT points to a non-existent file',
                 'startup_args': ['-txospenderindex=1'],
             },
+            {
+                'filepath_glob': 'indexes/scriptpubkeyindex/MANIFEST*',
+                'error_message': 'LevelDB error: Corruption: CURRENT points to a non-existent file',
+                'startup_args': ['-scriptpubkeyindex=1'],
+            },
             # Removing these files does not result in a startup error:
             # 'indexes/blockfilter/basic/*.dat', 'indexes/blockfilter/basic/db/*.*', 'indexes/coinstatsindex/db/*.*',
             # 'indexes/txindex/*.log', 'indexes/txindex/CURRENT', 'indexes/txindex/LOCK'
@@ -196,6 +202,11 @@ class InitTest(BitcoinTestFramework):
                 'filepath_glob': 'indexes/txospenderindex/db/*',
                 'error_message': 'LevelDB error: Corruption',
                 'startup_args': ['-txospenderindex=1'],
+            },
+            {
+                'filepath_glob': 'indexes/scriptpubkeyindex/*',
+                'error_message': 'LevelDB error: Corruption',
+                'startup_args': ['-scriptpubkeyindex=1'],
             },
             # Perturbing these files does not result in a startup error:
             # 'indexes/blockfilter/basic/*.dat', 'indexes/txindex/MANIFEST*', 'indexes/txindex/LOCK'

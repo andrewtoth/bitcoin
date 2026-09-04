@@ -22,8 +22,11 @@
 #include <hash.h>
 #include <index/blockfilterindex.h>
 #include <index/coinstatsindex.h>
+#include <index/scriptpubkeyindex.h>
+#include <index/txospenderindex.h>
 #include <interfaces/mining.h>
 #include <kernel/coinstats.h>
+#include <key_io.h>
 #include <logging/timer.h>
 #include <net.h>
 #include <net_processing.h>
@@ -38,6 +41,8 @@
 #include <rpc/server_util.h>
 #include <rpc/util.h>
 #include <script/descriptor.h>
+#include <script/script.h>
+#include <script/signingprovider.h>
 #include <serialize.h>
 #include <streams.h>
 #include <sync.h>
@@ -51,19 +56,26 @@
 #include <util/strencodings.h>
 #include <util/syserror.h>
 #include <util/translation.h>
+#include <util/vector.h>
 #include <validation.h>
 #include <validationinterface.h>
 #include <versionbits.h>
 
+#include <algorithm>
 #include <cstdint>
 
 #include <condition_variable>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <ranges>
+#include <set>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 using kernel::CCoinsStats;
@@ -3633,6 +3645,481 @@ return RPCMethod{
     };
 }
 
+namespace {
+constexpr uint64_t MAX_HISTORY_BYTES{50 * 1024 * 1024};
+
+//! A total transaction serialized size budget of all matching txs in one RPC call.
+//! Used to prevent DoS from scripts with very large histories.
+struct ScriptHistoryBudget {
+    const uint64_t max_bytes;
+    uint64_t total_bytes{0};
+    //! Used to count each tx only once when multiple outputs match a single tx.
+    std::set<std::pair<uint256, Txid>> seen;
+
+    explicit ScriptHistoryBudget(uint64_t max_bytes) : max_bytes{max_bytes} {}
+
+    enum class Source { CONFIRMED_MATCH, MEMPOOL_MATCH, EXTRA_SPENDER };
+
+    //! Throw std::runtime_error before exceeding max_bytes
+    void Add(const CTransaction& tx, const uint256& block_hash, Source source)
+    {
+        const auto occurrence{std::pair{block_hash, tx.GetHash()}};
+        if (seen.contains(occurrence)) return;
+        const uint64_t size{tx.ComputeTotalSize()};
+        if (total_bytes > max_bytes || size > max_bytes - total_bytes) {
+            std::string guidance;
+            switch (source) {
+            case Source::CONFIRMED_MATCH:
+                guidance = "Narrow the range with start_height/end_height.";
+                break;
+            case Source::MEMPOOL_MATCH:
+                guidance = "Set include_mempool=false.";
+                break;
+            case Source::EXTRA_SPENDER:
+                guidance = "Set include_spending_transactions=false.";
+                break;
+            }
+            throw std::runtime_error("Script history exceeds the " + std::to_string(max_bytes) + " byte serialized size limit. " + guidance);
+        }
+        seen.insert(occurrence);
+        total_bytes += size;
+    }
+};
+} // namespace
+
+struct ScriptHistoryTransaction {
+    struct Block {
+        uint256 hash;
+        int32_t height;
+    };
+
+    struct Output {
+        struct Spender {
+            CTransactionRef tx;
+            std::optional<Block> block;
+        };
+
+        uint32_t index;
+        bool spent{false};
+        std::optional<Spender> spending{};
+    };
+
+    CTransactionRef tx;
+    std::optional<Block> block;
+    std::vector<Output> outputs;
+};
+
+static RPCMethod getscripthistory()
+{
+    const auto spentness_doc{[](bool optional) {
+        return std::vector<RPCResult>{
+            {RPCResult::Type::BOOL, "spent", optional, "Whether the output was spent by a transaction on the active chain or in the mempool. Only present on outputs matching the queried script."},
+            {RPCResult::Type::STR_HEX, "spending_txid", /*optional=*/true, "Txid of the spending transaction. Its body is in transactions or spending_transactions. May be omitted if txospenderindex is not synced or include_spending_transactions is false."},
+        };
+    }};
+    const std::vector<RPCResult> spending_tx_v0{
+        {RPCResult::Type::STR_HEX, "txid", "The transaction id"},
+        {RPCResult::Type::STR_HEX, "hex", "The serialized, hex-encoded transaction"},
+        {RPCResult::Type::STR_HEX, "blockhash", /*optional=*/true, "The hash of the block that contains the transaction (omitted for mempool transactions)"},
+    };
+    const auto result_obj{[&](std::string_view condition, const std::vector<RPCResult>& matching_fields, const std::vector<RPCResult>& spending_fields) {
+        return RPCResult{
+            std::string{condition},
+            RPCResult::Type::OBJ,
+            "",
+            "",
+            {
+                {RPCResult::Type::ARR, "transactions", "Transactions that create outputs matching the queried script, in blockchain order (mempool last)", {
+                     {RPCResult::Type::OBJ, "", "", matching_fields},
+                 }},
+                {RPCResult::Type::ARR, "spending_transactions", /*optional=*/true, "Transactions that spend matching outputs and are not already listed in transactions (omitted when empty or include_spending_transactions is false). Confirmed spenders require -txospenderindex; mempool spenders require include_mempool.", {
+                     {RPCResult::Type::OBJ, "", "", spending_fields},
+                 }},
+                {RPCResult::Type::ARR, "pruned_blocks", /*optional=*/true, "Block hashes whose transaction data was needed but are pruned (omitted when empty).", {
+                     {RPCResult::Type::STR_HEX, "blockhash", "A pruned block hash"},
+                 }},
+            },
+        };
+    }};
+
+    return RPCMethod{
+        "getscripthistory",
+        "Returns transactions that create outputs matching a scriptPubKey, plus any transactions that spend those outputs.\n"
+        "The script may be specified as an address, an output descriptor, or SHA256 of the scriptPubKey (hex-encoded in Bitcoin byte order, same as Electrum scripthash).\n"
+        "Requires -scriptpubkeyindex. Confirmed history is served from the index. Unconfirmed matching transactions are found by scanning the mempool.\n"
+        "Spentness is taken from the UTXO set and optionally the mempool when include_mempool=true. Confirmed spending transactions that do not themselves contain scriptPubKey matches are only returned when -txospenderindex is synced and include_spending_transactions=true.\n\n"
+        "If verbosity is 0 or omitted, each transaction contains the serialized transaction as hex, plus spentness for matching outputs.\n"
+        "If verbosity is 1, each transaction is a JSON Object with the same fields as getrawtransaction verbosity 1, plus spentness for matching outputs.\n"
+        "If verbosity is 2, each transaction is a JSON Object with the same fields as getrawtransaction verbosity 2, plus spentness for matching outputs.\n"
+        "Mempool transactions omit blockhash, matching getrawtransaction.",
+        {
+            {"scripthash|address|descriptor", RPCArg::Type::STR, RPCArg::Optional::NO, "Address, output descriptor, or SHA256 of the scriptPubKey (hex-encoded in Bitcoin byte order, same as Electrum scripthash)."},
+            {"verbosity|verbose", RPCArg::Type::NUM, RPCArg::Default{0}, "0 for hex-encoded data, 1 for a JSON object, and 2 for JSON object with fee and prevout",
+             RPCArgOptions{.skip_type_check = true}},
+            {
+                "options",
+                RPCArg::Type::OBJ_NAMED_PARAMS,
+                RPCArg::Optional::OMITTED,
+                "",
+                {
+                    {"start_height", RPCArg::Type::NUM, RPCArg::Default{0}, "First block height to include (inclusive). Applies to confirmed matching-output transactions. Spending transactions of those outputs may be outside the range; their bodies are returned when include_spending_transactions is true."},
+                    {"end_height", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Last block height to include (inclusive). Defaults to the active chain tip. Applies to confirmed matching-output transactions. Spending transactions of those outputs may be outside the range; their bodies are returned when include_spending_transactions is true."},
+                    {"include_mempool", RPCArg::Type::BOOL, RPCArg::Default{true}, "If true, also return matching unconfirmed transactions and mark outputs spent if the spending transaction is unconfirmed. Spending transactions containing scriptPubKey matches are always returned; spending transactions that do not themselves contain scriptPubKey matches require include_spending_transactions."},
+                    {"include_spending_transactions", RPCArg::Type::BOOL, RPCArg::Default{true}, "If false, skip returning spending_transactions. Spent outputs will omit spending_txid if the spending transaction does not contain a scriptPubKey match."},
+                    {"range", RPCArg::Type::RANGE, RPCArg::Default{1000}, "The range of HD chain indexes to explore (either end or [begin,end]). Only valid for ranged descriptors."},
+                },
+            },
+        },
+        {
+            result_obj("if verbosity is not set or set to 0", Cat(spending_tx_v0, std::vector<RPCResult>{
+                {RPCResult::Type::ARR, "vout", "Matching outputs in this transaction", {
+                     {RPCResult::Type::OBJ, "", "", Cat(std::vector<RPCResult>{
+                         {RPCResult::Type::NUM, "n", "The output index"},
+                     }, spentness_doc(/*optional=*/false))},
+                 }},
+            }), spending_tx_v0),
+            result_obj("if verbosity is set to 1", RawTransactionDoc(1, {.extra_vout = spentness_doc(/*optional=*/true)}), RawTransactionDoc(1)),
+            result_obj("for verbosity = 2", RawTransactionDoc(2, {.extra_vout = spentness_doc(/*optional=*/true)}), RawTransactionDoc(2)),
+        },
+        RPCExamples{
+            HelpExampleCli("getscripthistory", "\"bc1qzl6nsgqzu89a66l50cvwapnkw5shh23zarqkw9\"")
+            + HelpExampleCli("getscripthistory", "\"addr(bc1qzl6nsgqzu89a66l50cvwapnkw5shh23zarqkw9)\" 1")
+            + HelpExampleCli("getscripthistory", "\"1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa\"")
+            + HelpExampleCli("getscripthistory", "\"8b01df4e368ea28f8dc0423bcf7a4923e3a12d307c875e47a0cfbf90b5a39161\"")
+            + HelpExampleCli("getscripthistory", "\"8b01df4e368ea28f8dc0423bcf7a4923e3a12d307c875e47a0cfbf90b5a39161\" 1")
+            + HelpExampleRpc("getscripthistory", "\"8b01df4e368ea28f8dc0423bcf7a4923e3a12d307c875e47a0cfbf90b5a39161\", 1")
+            + HelpExampleCli("getscripthistory", "\"8b01df4e368ea28f8dc0423bcf7a4923e3a12d307c875e47a0cfbf90b5a39161\" 2")
+            + HelpExampleCliNamed("getscripthistory", {{"scripthash", "8b01df4e368ea28f8dc0423bcf7a4923e3a12d307c875e47a0cfbf90b5a39161"}, {"verbosity", 1}, {"start_height", 800000}})
+            + HelpExampleCliNamed("getscripthistory", {{"address", "bc1qzl6nsgqzu89a66l50cvwapnkw5shh23zarqkw9"}, {"verbosity", 1}, {"start_height", 700000}, {"end_height", 700100}})
+            + HelpExampleCliNamed("getscripthistory", {{"descriptor", "addr(1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa)"}, {"start_height", 0}, {"end_height", 1000}, {"include_mempool", false}})
+        },
+        [](const RPCMethod& self, const JSONRPCRequest& request) -> UniValue {
+            if (!g_scriptpubkeyindex) {
+                throw JSONRPCError(RPC_MISC_ERROR, "scriptpubkeyindex is not enabled. Run with -scriptpubkeyindex.");
+            }
+            const UniValue options{request.params[2].isNull() ? UniValue::VOBJ : request.params[2]};
+            RPCTypeCheckObj(options,
+                            {
+                                {"start_height", UniValueType(UniValue::VNUM)},
+                                {"end_height", UniValueType(UniValue::VNUM)},
+                                {"include_mempool", UniValueType(UniValue::VBOOL)},
+                                {"include_spending_transactions", UniValueType(UniValue::VBOOL)},
+                                {"range", UniValueType()},
+                            },
+                            /*fAllowNull=*/true, /*fStrict=*/true);
+
+            const int32_t verbosity{ParseVerbosity(request.params[1], /*default_verbosity=*/0, /*allow_bool=*/true)};
+            const int32_t start_height{options.exists("start_height") ? options["start_height"].getInt<int32_t>() : 0};
+            if (start_height < 0) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "start_height cannot be negative");
+            }
+            const bool include_mempool{options.exists("include_mempool") ? options["include_mempool"].get_bool() : true};
+            const bool include_spending_transactions{options.exists("include_spending_transactions") ? options["include_spending_transactions"].get_bool() : true};
+            using BudgetSource = ScriptHistoryBudget::Source;
+            const std::optional<int32_t> requested_end_height{options.exists("end_height") ? std::make_optional(options["end_height"].getInt<int32_t>()) : std::nullopt};
+            if (requested_end_height && *requested_end_height < start_height) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "end_height must be greater than or equal to start_height");
+            }
+
+            const std::string& query{request.params[0].get_str()};
+            std::set<uint256> script_hashes;
+            std::set<CScript> scripts;
+            const CTxDestination destination{DecodeDestination(query)};
+            const bool is_address{IsValidDestination(destination)};
+            const bool is_hash{query.size() == 64 && IsHex(query)};
+            if (is_address || is_hash) {
+                if (options.exists("range")) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER, "range is only valid for ranged descriptors");
+                }
+                if (is_address) {
+                    scripts.insert(GetScriptForDestination(destination));
+                } else {
+                    script_hashes.insert(*Assert(uint256::FromHex(query)));
+                }
+            } else {
+                UniValue scan_object{UniValue::VOBJ};
+                scan_object.pushKV("desc", query);
+                if (options.exists("range")) scan_object.pushKV("range", options["range"]);
+                FlatSigningProvider provider;
+                for (const CScript& script : EvalDescriptorStringOrObject(scan_object, provider)) scripts.insert(script);
+            }
+            for (const CScript& script : scripts) script_hashes.insert(scriptpubkeyindex::Sha256ScriptPubKey(script));
+
+            const NodeContext& node{EnsureAnyNodeContext(request.context)};
+            ChainstateManager& chainman{EnsureChainman(node)};
+            const CBlockIndex* tip{WITH_LOCK(cs_main, return chainman.ActiveChain().Tip())};
+            if (!g_scriptpubkeyindex->BlockUntilSyncedToCurrentChain()) {
+                throw JSONRPCError(RPC_MISC_ERROR, "scriptpubkeyindex is still syncing.");
+            }
+            const int32_t end_height{requested_end_height.value_or(tip->nHeight)};
+
+            // We stop early if we select more than MAX_HISTORY_BYTES worth of txs to return.
+            ScriptHistoryBudget budget{MAX_HISTORY_BYTES};
+
+            // Find all outputs matching the scripts, and merge them by block height and tx offset (we can't key by txid because of BIP30 duplicates).
+            std::vector<ScriptHistoryTransaction> matches;
+            std::set<uint256> pruned_blocks;
+            {
+                std::map<std::pair<int32_t, uint32_t>, ScriptHistoryTransaction> by_position;
+                for (const uint256& hash : script_hashes) {
+                    auto result{g_scriptpubkeyindex->Find(hash, start_height, end_height, [&](const CTransaction& tx, const uint256& block_hash) {
+                        budget.Add(tx, block_hash, BudgetSource::CONFIRMED_MATCH);
+                    })};
+                    if (!result) throw JSONRPCError(RPC_MISC_ERROR, result.error());
+                    for (auto& lookup : *result) {
+                        if (!lookup.tx) {
+                            pruned_blocks.insert(lookup.block_hash);
+                            continue;
+                        }
+                        const auto it{by_position.try_emplace(std::pair{lookup.height, lookup.tx_offset}, std::move(lookup.tx), ScriptHistoryTransaction::Block{lookup.block_hash, lookup.height}, std::vector<ScriptHistoryTransaction::Output>{}).first};
+                        for (const uint32_t index : lookup.outputs) it->second.outputs.emplace_back(index);
+                    }
+                }
+                matches.reserve(by_position.size());
+                for (auto& [_, match] : by_position) {
+                    std::ranges::sort(match.outputs, {}, &ScriptHistoryTransaction::Output::index);
+                    matches.push_back(std::move(match));
+                }
+            }
+
+            // Check the UTXO set for whether the outputs are spent or not.
+            {
+                LOCK(cs_main);
+                const CCoinsViewCache& coins{chainman.ActiveChainstate().CoinsTip()};
+                for (auto& match : matches) {
+                    // Genesis and overwritten BIP30 outputs were never consumed by a spender.
+                    if (match.block->height == 0 || (match.tx->IsCoinBase() && IsBIP30Unspendable(match.block->hash, match.block->height))) continue;
+                    for (auto& output : match.outputs) {
+                        output.spent = !match.tx->vout[output.index].scriptPubKey.IsUnspendable() &&
+                                       !coins.HaveCoin(COutPoint{match.tx->GetHash(), output.index});
+                    }
+                }
+            }
+
+            if (CTxMemPool* pool{include_mempool ? node.mempool.get() : nullptr}) {
+                LOCK(pool->cs);
+                // Check the mempool for tx outputs matching the scripts.
+                for (const CTxMemPoolEntry& entry : pool->entryAll()) {
+                    const auto& tx{entry.GetSharedTx()};
+                    ScriptHistoryTransaction match{tx, std::nullopt, {}};
+                    for (const uint32_t index : std::views::iota(uint32_t{0}, tx->vout.size())) {
+                        const CScript& script{tx->vout[index].scriptPubKey};
+                        if (scripts.empty() ? script_hashes.contains(scriptpubkeyindex::Sha256ScriptPubKey(script)) : scripts.contains(script)) {
+                            match.outputs.emplace_back(index);
+                        }
+                    }
+                    if (!match.outputs.empty()) {
+                        budget.Add(*tx, uint256{}, BudgetSource::MEMPOOL_MATCH);
+                        matches.push_back(std::move(match));
+                    }
+                }
+                // Check the mempool for txs spending matching outputs.
+                for (auto& match : matches) {
+                    if (match.block && match.tx->IsCoinBase() && IsBIP30Unspendable(match.block->hash, match.block->height)) continue;
+                    for (auto& output : match.outputs) {
+                        if (output.spent) continue;
+                        const COutPoint outpoint{match.tx->GetHash(), output.index};
+                        if (const CTransaction* conflict{pool->GetConflictTx(outpoint)}) {
+                            output.spent = true;
+                            if (include_spending_transactions) {
+                                budget.Add(*conflict, uint256{}, BudgetSource::EXTRA_SPENDER);
+                                output.spending = ScriptHistoryTransaction::Output::Spender{pool->get(conflict->GetHash()), std::nullopt};
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Collect all spent outputs that are missing their spending tx.
+            std::map<COutPoint, ScriptHistoryTransaction::Output*> unresolved;
+            for (auto& match : matches) {
+                for (auto& output : match.outputs) {
+                    if (!output.spent || output.spending) continue;
+                    unresolved.emplace(COutPoint{match.tx->GetHash(), output.index}, &output);
+                }
+            }
+
+            // Resolve spending txs that are matched output's txs.
+            for (const auto& match : matches) {
+                if (unresolved.empty()) break;
+                for (const auto& input : match.tx->vin) {
+                    const auto it{unresolved.find(input.prevout)};
+                    if (it == unresolved.end()) continue;
+                    it->second->spending = ScriptHistoryTransaction::Output::Spender{match.tx, match.block};
+                    unresolved.erase(it);
+                    if (unresolved.empty()) break;
+                }
+            }
+
+            std::vector<ScriptHistoryTransaction::Output::Spender> extra_spenders;
+            if (include_spending_transactions) {
+                // For any remaining outputs with missing spending txs, look up the spending txs via the txospenderindex.
+                if (!unresolved.empty() && g_txospenderindex && g_txospenderindex->BlockUntilSyncedToCurrentChain()) {
+                    for (const auto& [outpoint, output] : unresolved) {
+                        const auto result{g_txospenderindex->FindSpender(outpoint)};
+                        if (!result) {
+                            throw JSONRPCError(RPC_MISC_ERROR, result.error());
+                        }
+                        if (!result->has_value()) continue;
+                        const TxoSpender& spender{result->value()};
+                        budget.Add(*spender.tx, spender.block_hash, BudgetSource::EXTRA_SPENDER);
+                        const CBlockIndex* block_index{WITH_LOCK(cs_main, return chainman.m_blockman.LookupBlockIndex(spender.block_hash))};
+                        CHECK_NONFATAL(block_index);
+                        output->spending = ScriptHistoryTransaction::Output::Spender{spender.tx, ScriptHistoryTransaction::Block{spender.block_hash, block_index->nHeight}};
+                    }
+                }
+
+                // Collect spending txs that do not have any matching outputs separately, then sort them.
+                std::set<std::pair<uint256, Txid>> seen_transactions;
+                for (const auto& match : matches) seen_transactions.emplace(match.block ? match.block->hash : uint256{}, match.tx->GetHash());
+                for (const auto& match : matches) {
+                    for (const auto& output : match.outputs) {
+                        if (output.spending && seen_transactions.emplace(output.spending->block ? output.spending->block->hash : uint256{}, output.spending->tx->GetHash()).second) {
+                            extra_spenders.push_back(*output.spending);
+                        }
+                    }
+                }
+                std::ranges::sort(extra_spenders, [](const ScriptHistoryTransaction::Output::Spender& a, const ScriptHistoryTransaction::Output::Spender& b) {
+                    const bool a_confirmed{a.block.has_value()};
+                    const bool b_confirmed{b.block.has_value()};
+                    if (a_confirmed != b_confirmed) return a_confirmed;
+                    if (a_confirmed) return a.block->height < b.block->height;
+                    return a.tx->GetHash() < b.tx->GetHash();
+                });
+
+                // txospenderindex doesn't give us the positions of txs within blocks. Group spending txs by block, and sort them by their positions in the block.
+                for (auto block_begin{extra_spenders.begin()}; block_begin != extra_spenders.end() && block_begin->block;) {
+                    const auto block_end{std::find_if(block_begin, extra_spenders.end(), [&](const auto& spender) { return !spender.block || spender.block->hash != block_begin->block->hash; })};
+                    if (block_end - block_begin > 1) {
+                        const CBlockIndex* block_index{WITH_LOCK(cs_main, return chainman.m_blockman.LookupBlockIndex(block_begin->block->hash))};
+                        CHECK_NONFATAL(block_index);
+                        const CBlock block{GetBlockChecked(chainman.m_blockman, *block_index)};
+                        std::map<Txid, size_t> tx_positions;
+                        for (const size_t index : std::views::iota(size_t{0}, block.vtx.size())) {
+                            tx_positions.emplace(block.vtx[index]->GetHash(), index);
+                        }
+                        std::sort(block_begin, block_end, [&](const auto& a, const auto& b) {
+                            return tx_positions.at(a.tx->GetHash()) < tx_positions.at(b.tx->GetHash());
+                        });
+                    }
+                    block_begin = block_end;
+                }
+            }
+
+            // Cache the active chainstate for later serialization.
+            Chainstate* active_chainstate{WITH_LOCK(cs_main, return &chainman.CurrentChainstate())};
+
+            // Helper to serialize the tx to json.
+            // Caches one block's undo data and transaction positions for verbosity level 2 until a different block is needed (txs in the same block will be called one after another).
+            std::optional<uint256> undo_block_hash;
+            CBlockUndo block_undo;
+            std::map<Txid, size_t> undo_positions;
+            const auto tx_to_json{[&](const CTransaction& tx, const std::optional<ScriptHistoryTransaction::Block>& block_info) {
+                const std::optional<uint256> block_hash{block_info ? std::make_optional(block_info->hash) : std::nullopt};
+                UniValue entry{UniValue::VOBJ};
+                if (verbosity <= 0) {
+                    entry.pushKV("txid", tx.GetHash().GetHex());
+                    entry.pushKV("hex", EncodeHexTx(tx));
+                    if (block_hash) entry.pushKV("blockhash", block_hash->GetHex());
+                    return entry;
+                }
+
+                const CTxUndo* txundo{nullptr};
+                if (verbosity >= 2 && block_hash && !tx.IsCoinBase()) {
+                    if (undo_block_hash != block_hash) {
+                        undo_block_hash = block_hash;
+                        block_undo = {};
+                        undo_positions.clear();
+                        const CBlockIndex* block_index;
+                        {
+                            LOCK(cs_main);
+                            block_index = chainman.m_blockman.LookupBlockIndex(*block_hash);
+                            // Re-fetched pruned blocks may have block data but no undo data.
+                            if (block_index && !(block_index->nStatus & BLOCK_HAVE_UNDO)) block_index = nullptr;
+                        }
+                        if (block_index) {
+                            if (!chainman.m_blockman.ReadBlockUndo(block_undo, *block_index)) {
+                                throw JSONRPCError(RPC_INTERNAL_ERROR, "Block undo data expected but can't be read.");
+                            }
+                            CBlock block;
+                            if (!chainman.m_blockman.ReadBlock(block, *block_index)) {
+                                throw JSONRPCError(RPC_INTERNAL_ERROR, "Block data expected but can't be read.");
+                            }
+                            for (const size_t index : std::views::iota(size_t{1}, block.vtx.size())) {
+                                undo_positions.emplace(block.vtx[index]->GetHash(), index - 1);
+                            }
+                        }
+                    }
+                    if (const auto it{undo_positions.find(tx.GetHash())}; it != undo_positions.end()) {
+                        txundo = &block_undo.vtxundo.at(it->second);
+                    }
+                }
+                TxToJSON(tx, block_hash.value_or(uint256{}), entry, *active_chainstate, txundo,
+                         verbosity >= 2 ? TxVerbosity::SHOW_DETAILS_AND_PREVOUT : TxVerbosity::SHOW_DETAILS);
+                return entry;
+            }};
+
+            // Helper to add the "spent" and "spending_txid" fields to the output object.
+            const auto annotate_output{[](UniValue& json, const ScriptHistoryTransaction::Output& output) {
+                json.pushKV("spent", output.spent);
+                if (output.spending) {
+                    json.pushKV("spending_txid", output.spending->tx->GetHash().GetHex());
+                }
+            }};
+
+            // Serialize the matches as transactions.
+            UniValue transactions{UniValue::VARR};
+            for (const auto& match : matches) {
+                UniValue tx_json{tx_to_json(*match.tx, match.block)};
+                UniValue vouts{UniValue::VARR};
+                if (verbosity <= 0) {
+                    // Verbosity 0 has no vout yet, so add only the matching outputs.
+                    for (const auto& output : match.outputs) {
+                        UniValue json{UniValue::VOBJ};
+                        json.pushKV("n", output.index);
+                        annotate_output(json, output);
+                        vouts.push_back(std::move(json));
+                    }
+                } else {
+                    // Other verbosities already have vout, so only annotate the matching entries.
+                    auto decoded_outputs{tx_json["vout"].getValues()};
+                    for (const auto& output : match.outputs) {
+                        annotate_output(decoded_outputs.at(output.index), output);
+                    }
+                    for (auto& json : decoded_outputs) {
+                        vouts.push_back(std::move(json));
+                    }
+                }
+                tx_json.pushKV("vout", std::move(vouts));
+                transactions.push_back(std::move(tx_json));
+            }
+
+            // Serialize the extra_spenders as spending_transactions.
+            UniValue spending_transactions{UniValue::VARR};
+            for (const auto& spender : extra_spenders) {
+                spending_transactions.push_back(tx_to_json(*spender.tx, spender.block));
+            }
+
+            UniValue result{UniValue::VOBJ};
+            result.pushKV("transactions", std::move(transactions));
+            if (!spending_transactions.empty()) {
+                result.pushKV("spending_transactions", std::move(spending_transactions));
+            }
+            if (!pruned_blocks.empty()) {
+                UniValue pruned{UniValue::VARR};
+                for (const uint256& hash : pruned_blocks) {
+                    pruned.push_back(hash.GetHex());
+                }
+                result.pushKV("pruned_blocks", std::move(pruned));
+            }
+            // The above lookups and serialization might not be consistent if the tip changed out from under us. Best not to return a valid response in that case.
+            if (WITH_LOCK(cs_main, return chainman.ActiveChain().Tip() != tip)) {
+                throw JSONRPCError(RPC_MISC_ERROR, "Chain tip changed during the query. Retry the query.");
+            }
+            return result;
+        },
+    };
+}
 
 void RegisterBlockchainRPCCommands(CRPCTable& t)
 {
@@ -3657,6 +4144,7 @@ void RegisterBlockchainRPCCommands(CRPCTable& t)
         {"blockchain", &scantxoutset},
         {"blockchain", &scanblocks},
         {"blockchain", &getdescriptoractivity},
+        {"blockchain", &getscripthistory},
         {"blockchain", &getblockfilter},
         {"blockchain", &dumptxoutset},
         {"blockchain", &loadtxoutset},
