@@ -8,8 +8,8 @@
 #include <crypto/hex_base.h>
 #include <dbwrapper.h>
 #include <index/ordered_varint.h>
-#include <index/scriptpubkeyindex.h>
-#include <index/scriptpubkeyindex_key.h>
+#include <index/txoscriptindex.h>
+#include <index/txoscriptindex_key.h>
 #include <interfaces/chain.h>
 #include <key.h>
 #include <primitives/transaction.h>
@@ -32,12 +32,12 @@
 
 #include <boost/test/unit_test.hpp>
 
-BOOST_AUTO_TEST_SUITE(scriptpubkeyindex_tests)
+BOOST_AUTO_TEST_SUITE(txoscriptindex_tests)
 
-class ScriptPubKeyIndexTest
+class TxoScriptIndexTest
 {
 public:
-    static CDBWrapper& GetDB(const ScriptPubKeyIndex& index) { return index.GetDB(); }
+    static CDBWrapper& GetDB(const TxoScriptIndex& index) { return index.GetDB(); }
 };
 
 static std::vector<std::byte> EncodeOrderedVarInt(uint64_t value)
@@ -85,7 +85,7 @@ BOOST_AUTO_TEST_CASE(ordered_varint_exact_encoding_and_roundtrip)
     }
 
     // Pin the complete persisted key format as well as the height encoding.
-    BOOST_CHECK_EQUAL(HexStr(DataStream{} << scriptpubkeyindex::DBKey{0x0102030405, 128, 81}), "7801020304058000000051");
+    BOOST_CHECK_EQUAL(HexStr(DataStream{} << txoscriptindex::DBKey{0x0102030405, 128, 81}), "7801020304058000000051");
 }
 
 BOOST_AUTO_TEST_CASE(ordered_varint_invalid_encodings)
@@ -127,13 +127,13 @@ BOOST_AUTO_TEST_CASE(ordered_varint_lexicographic_order)
     }
 }
 
-BOOST_FIXTURE_TEST_CASE(scriptpubkeyindex_initial_sync, TestChain100Setup)
+BOOST_FIXTURE_TEST_CASE(txoscriptindex_initial_sync, TestChain100Setup)
 {
     const CScript& coinbase_script{m_coinbase_txns[0]->vout[0].scriptPubKey};
-    const uint256 script_hash{scriptpubkeyindex::Sha256ScriptPubKey(coinbase_script)};
+    const uint256 script_hash{txoscriptindex::Sha256ScriptPubKey(coinbase_script)};
     const int32_t tip_height{WITH_LOCK(::cs_main, return m_node.chainman->ActiveHeight())};
 
-    ScriptPubKeyIndex index{interfaces::MakeChain(m_node), 1_MiB, /*memory=*/true};
+    TxoScriptIndex index{interfaces::MakeChain(m_node), 1_MiB, /*memory=*/true};
     BOOST_REQUIRE(index.Init());
     BOOST_CHECK(index.Find(script_hash, /*start_height=*/0, tip_height, IgnoreMatch).value().empty());
 
@@ -159,10 +159,10 @@ BOOST_FIXTURE_TEST_CASE(scriptpubkeyindex_initial_sync, TestChain100Setup)
     index.Stop();
 }
 
-BOOST_FIXTURE_TEST_CASE(scriptpubkeyindex_collisions_and_pruned_blocks, TestChain100Setup)
+BOOST_FIXTURE_TEST_CASE(txoscriptindex_collisions_and_pruned_blocks, TestChain100Setup)
 {
     const CScript target_script{CScript() << OP_TRUE};
-    const uint256 script_hash{scriptpubkeyindex::Sha256ScriptPubKey(target_script)};
+    const uint256 script_hash{txoscriptindex::Sha256ScriptPubKey(target_script)};
     const auto first_block{CreateAndProcessBlock({}, target_script)};
     const auto second_block{CreateAndProcessBlock({}, target_script)};
     m_node.validation_signals->SyncWithValidationInterfaceQueue();
@@ -173,21 +173,21 @@ BOOST_FIXTURE_TEST_CASE(scriptpubkeyindex_collisions_and_pruned_blocks, TestChai
         BOOST_CHECK(block_hash == first_block.GetHash() || block_hash == second_block.GetHash());
         ++callbacks;
     }};
-    ScriptPubKeyIndex index{interfaces::MakeChain(m_node), 1_MiB, /*memory=*/true};
+    TxoScriptIndex index{interfaces::MakeChain(m_node), 1_MiB, /*memory=*/true};
     BOOST_REQUIRE(index.Init());
     index.Sync();
-    CDBWrapper& db{ScriptPubKeyIndexTest::GetDB(index)};
+    CDBWrapper& db{TxoScriptIndexTest::GetDB(index)};
     std::pair<uint64_t, uint64_t> salt;
-    BOOST_REQUIRE(db.Read(scriptpubkeyindex::DB_SPK_HASH_SALT, salt));
-    const auto prefix{scriptpubkeyindex::CreateKeyPrefix(SipHasher13UJ{salt.first, salt.second}, script_hash)};
+    BOOST_REQUIRE(db.Read(txoscriptindex::DB_SPK_HASH_SALT, salt));
+    const auto prefix{txoscriptindex::CreateKeyPrefix(SipHasher13UJ{salt.first, salt.second}, script_hash)};
 
     // Inject prefix collisions pointing at unrelated coinbases before the real
     // matches. Their full script hashes must be checked before returning them.
     for (uint32_t height{1}; height <= 3; ++height) {
-        db.Write(scriptpubkeyindex::DBKey{prefix, height, 81}, scriptpubkeyindex::EMPTY_VALUE);
+        db.Write(txoscriptindex::DBKey{prefix, height, 81}, txoscriptindex::EMPTY_VALUE);
     }
     // Two candidate transactions in one pruned block must produce one warning.
-    db.Write(scriptpubkeyindex::DBKey{prefix, 3, 82}, scriptpubkeyindex::EMPTY_VALUE);
+    db.Write(txoscriptindex::DBKey{prefix, 3, 82}, txoscriptindex::EMPTY_VALUE);
     CBlockIndex* pruned_block{WITH_LOCK(cs_main, return m_node.chainman->ActiveChain()[3])};
     const auto original_status{WITH_LOCK(cs_main, return pruned_block->nStatus)};
     WITH_LOCK(cs_main, pruned_block->nStatus &= ~BLOCK_HAVE_DATA);
@@ -207,10 +207,10 @@ BOOST_FIXTURE_TEST_CASE(scriptpubkeyindex_collisions_and_pruned_blocks, TestChai
     index.Stop();
 }
 
-BOOST_FIXTURE_TEST_CASE(scriptpubkeyindex_read_failures, TestChain100Setup)
+BOOST_FIXTURE_TEST_CASE(txoscriptindex_read_failures, TestChain100Setup)
 {
-    const uint256 script_hash{scriptpubkeyindex::Sha256ScriptPubKey(m_coinbase_txns[0]->vout[0].scriptPubKey)};
-    ScriptPubKeyIndex index{interfaces::MakeChain(m_node), 1_MiB, /*memory=*/true};
+    const uint256 script_hash{txoscriptindex::Sha256ScriptPubKey(m_coinbase_txns[0]->vout[0].scriptPubKey)};
+    TxoScriptIndex index{interfaces::MakeChain(m_node), 1_MiB, /*memory=*/true};
     BOOST_REQUIRE(index.Init());
     index.Sync();
     CBlockIndex* block{WITH_LOCK(cs_main, return m_node.chainman->ActiveChain()[1])};
@@ -219,7 +219,7 @@ BOOST_FIXTURE_TEST_CASE(scriptpubkeyindex_read_failures, TestChain100Setup)
     {
         const auto result{index.Find(script_hash, 1, 1, IgnoreMatch)};
         BOOST_REQUIRE(!result);
-        BOOST_CHECK(result.error().starts_with("Unable to read scriptpubkeyindex transaction in block " + block->GetBlockHash().ToString() + ": "));
+        BOOST_CHECK(result.error().starts_with("Unable to read txoscriptindex transaction in block " + block->GetBlockHash().ToString() + ": "));
     }
     WITH_LOCK(cs_main, block->nFile = original_file);
 
@@ -230,14 +230,14 @@ BOOST_FIXTURE_TEST_CASE(scriptpubkeyindex_read_failures, TestChain100Setup)
     {
         const auto result{index.Find(script_hash, 1, 1, IgnoreMatch)};
         BOOST_REQUIRE(!result);
-        BOOST_CHECK(result.error().starts_with("Unable to read scriptpubkeyindex transaction in block " + block->GetBlockHash().ToString() + ": "));
+        BOOST_CHECK(result.error().starts_with("Unable to read txoscriptindex transaction in block " + block->GetBlockHash().ToString() + ": "));
     }
     WITH_LOCK(cs_main, block->nDataPos = original_pos);
     BOOST_CHECK_EQUAL(index.Find(script_hash, 1, 1, IgnoreMatch).value().size(), 1);
     index.Stop();
 }
 
-BOOST_FIXTURE_TEST_CASE(scriptpubkeyindex_multi_output, TestChain100Setup)
+BOOST_FIXTURE_TEST_CASE(txoscriptindex_multi_output, TestChain100Setup)
 {
     const CScript& coinbase_script{m_coinbase_txns[0]->vout[0].scriptPubKey};
     const CScript dest_script{GetScriptForDestination(PKHash(GenerateRandomKey().GetPubKey()))};
@@ -259,15 +259,15 @@ BOOST_FIXTURE_TEST_CASE(scriptpubkeyindex_multi_output, TestChain100Setup)
     const uint256 tip_hash{block.GetHash()};
     m_node.validation_signals->SyncWithValidationInterfaceQueue();
 
-    ScriptPubKeyIndex index{interfaces::MakeChain(m_node), 1_MiB, /*memory=*/true};
+    TxoScriptIndex index{interfaces::MakeChain(m_node), 1_MiB, /*memory=*/true};
     BOOST_REQUIRE(index.Init());
     index.Sync();
     const int32_t tip_height{WITH_LOCK(::cs_main, return m_node.chainman->ActiveHeight())};
-    const auto matches{index.Find(scriptpubkeyindex::Sha256ScriptPubKey(dest_script), /*start_height=*/0, tip_height, IgnoreMatch).value()};
+    const auto matches{index.Find(txoscriptindex::Sha256ScriptPubKey(dest_script), /*start_height=*/0, tip_height, IgnoreMatch).value()};
     BOOST_REQUIRE_EQUAL(matches.size(), 1);
     BOOST_REQUIRE(matches[0].tx);
     BOOST_CHECK(matches[0].tx->GetHash() == tx.GetHash());
-    BOOST_CHECK_EQUAL(matches[0].tx_offset, scriptpubkeyindex::BLOCK_HEADER_SIZE + GetSizeOfCompactSize(block.vtx.size()) + block.vtx[0]->ComputeTotalSize());
+    BOOST_CHECK_EQUAL(matches[0].tx_offset, txoscriptindex::BLOCK_HEADER_SIZE + GetSizeOfCompactSize(block.vtx.size()) + block.vtx[0]->ComputeTotalSize());
     BOOST_REQUIRE_EQUAL(matches[0].outputs.size(), 2);
     BOOST_CHECK_EQUAL(matches[0].outputs[0], 0);
     BOOST_CHECK_EQUAL(matches[0].outputs[1], 1);
@@ -280,10 +280,10 @@ BOOST_FIXTURE_TEST_CASE(scriptpubkeyindex_multi_output, TestChain100Setup)
         BOOST_CHECK(block_hash == tip_hash);
         ++callbacks;
     }};
-    const auto repeated{index.Find(scriptpubkeyindex::Sha256ScriptPubKey(dest_script), 0, tip_height, on_match).value()};
+    const auto repeated{index.Find(txoscriptindex::Sha256ScriptPubKey(dest_script), 0, tip_height, on_match).value()};
     BOOST_REQUIRE_EQUAL(repeated.size(), 1);
     BOOST_CHECK(repeated[0].outputs == matches[0].outputs);
-    const auto other_script{index.Find(scriptpubkeyindex::Sha256ScriptPubKey(tx.vout[2].scriptPubKey), 0, tip_height, on_match).value()};
+    const auto other_script{index.Find(txoscriptindex::Sha256ScriptPubKey(tx.vout[2].scriptPubKey), 0, tip_height, on_match).value()};
     BOOST_REQUIRE_EQUAL(other_script.size(), 1);
     BOOST_REQUIRE_EQUAL(other_script[0].outputs.size(), 1);
     BOOST_CHECK_EQUAL(other_script[0].outputs[0], 2);
@@ -291,10 +291,10 @@ BOOST_FIXTURE_TEST_CASE(scriptpubkeyindex_multi_output, TestChain100Setup)
     index.Stop();
 }
 
-BOOST_FIXTURE_TEST_CASE(scriptpubkeyindex_callback_stops_lookup, TestChain100Setup)
+BOOST_FIXTURE_TEST_CASE(txoscriptindex_callback_stops_lookup, TestChain100Setup)
 {
-    const uint256 script_hash{scriptpubkeyindex::Sha256ScriptPubKey(m_coinbase_txns[0]->vout[0].scriptPubKey)};
-    ScriptPubKeyIndex index{interfaces::MakeChain(m_node), 1_MiB, /*memory=*/true};
+    const uint256 script_hash{txoscriptindex::Sha256ScriptPubKey(m_coinbase_txns[0]->vout[0].scriptPubKey)};
+    TxoScriptIndex index{interfaces::MakeChain(m_node), 1_MiB, /*memory=*/true};
     BOOST_REQUIRE(index.Init());
     index.Sync();
 

@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_INDEX_SCRIPTPUBKEYINDEX_H
-#define BITCOIN_INDEX_SCRIPTPUBKEYINDEX_H
+#ifndef BITCOIN_INDEX_TXOSCRIPTINDEX_H
+#define BITCOIN_INDEX_TXOSCRIPTINDEX_H
 
 #include <crypto/sha256.h>
 #include <index/base.h>
@@ -19,26 +19,26 @@
 #include <string>
 #include <vector>
 
-namespace scriptpubkeyindex {
+namespace txoscriptindex {
 inline uint256 Sha256ScriptPubKey(const CScript& script)
 {
     uint256 hash;
     CSHA256().Write(script.data(), script.size()).Finalize(hash.data());
     return hash;
 }
-} // namespace scriptpubkeyindex
+} // namespace txoscriptindex
 
 namespace interfaces {
 class Chain;
 }
 
-namespace scriptpubkeyindex_tests {
-class ScriptPubKeyIndexTest;
+namespace txoscriptindex_tests {
+class TxoScriptIndexTest;
 }
 
-inline constexpr bool DEFAULT_SCRIPTPUBKEYINDEX{false};
+inline constexpr bool DEFAULT_TXOSCRIPTINDEX{false};
 
-//! Result of a scriptpubkeyindex prefix lookup.
+//! Result of a txoscriptindex prefix lookup.
 //! `tx` is null when a matching key was found but the block has been pruned.
 struct ScriptHistoryMatch {
     CTransactionRef tx;
@@ -52,13 +52,13 @@ struct ScriptHistoryMatch {
 };
 
 /**
- * ScriptPubKeyIndex is used to look up transactions creating outputs with a given script.
+ * TxoScriptIndex is used to look up transactions creating outputs with a given script.
  * The index is written to a LevelDB database and, for each distinct script of each transaction in a block,
  * records the SHA256(script), along with the block height and position of the transaction in the block.
  */
-class ScriptPubKeyIndex final : public BaseIndex
+class TxoScriptIndex final : public BaseIndex
 {
-    friend class scriptpubkeyindex_tests::ScriptPubKeyIndexTest;
+    friend class txoscriptindex_tests::TxoScriptIndexTest;
 
 protected:
     class DB;
@@ -78,9 +78,9 @@ protected:
     BaseIndex::DB& GetDB() const override;
 
 public:
-    explicit ScriptPubKeyIndex(std::unique_ptr<interfaces::Chain> chain, size_t cache_size, bool memory = false, bool wipe = false);
+    explicit TxoScriptIndex(std::unique_ptr<interfaces::Chain> chain, size_t cache_size, bool memory = false, bool wipe = false);
 
-    ~ScriptPubKeyIndex() override;
+    ~TxoScriptIndex() override;
 
     /**
      * Search the index for confirmed transactions with outputs matching the given script hash.
@@ -98,6 +98,6 @@ public:
     util::Expected<std::vector<ScriptHistoryMatch>, std::string> Find(const uint256& script_hash, int32_t start_height, int32_t end_height, const std::function<void(const CTransaction&, const uint256&)>& on_match) const;
 };
 
-extern std::unique_ptr<ScriptPubKeyIndex> g_scriptpubkeyindex;
+extern std::unique_ptr<TxoScriptIndex> g_txoscriptindex;
 
-#endif // BITCOIN_INDEX_SCRIPTPUBKEYINDEX_H
+#endif // BITCOIN_INDEX_TXOSCRIPTINDEX_H

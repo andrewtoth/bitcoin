@@ -25,7 +25,7 @@
 #include <index/base.h>
 #include <index/blockfilterindex.h>
 #include <index/coinstatsindex.h>
-#include <index/scriptpubkeyindex.h>
+#include <index/txoscriptindex.h>
 #include <index/txospenderindex.h>
 #include <interfaces/types.h>
 #include <kernel/coinstats.h>
@@ -3771,7 +3771,7 @@ static RPCMethod getscripthistory()
         "getscripthistory",
         "Returns transactions that create outputs matching a scriptPubKey, plus any transactions that spend those outputs.\n"
         "The script may be specified as an address, an output descriptor, or SHA256 of the scriptPubKey (hex-encoded in Bitcoin byte order, same as Electrum scripthash).\n"
-        "Requires -scriptpubkeyindex. Confirmed history is served from the index. Unconfirmed matching transactions are found by scanning the mempool.\n"
+        "Requires -txoscriptindex. Confirmed history is served from the index. Unconfirmed matching transactions are found by scanning the mempool.\n"
         "Spentness is taken from the UTXO set and optionally the mempool when include_mempool=true. Confirmed spending transactions that do not themselves contain scriptPubKey matches are only returned when -txospenderindex is synced and include_spending_transactions=true.\n\n"
         "If verbosity is 0 or omitted, each transaction contains the serialized transaction as hex, plus spentness for matching outputs.\n"
         "If verbosity is 1, each transaction is a JSON Object with the same fields as getrawtransaction verbosity 1, plus spentness for matching outputs.\n"
@@ -3819,8 +3819,8 @@ static RPCMethod getscripthistory()
             + HelpExampleCliNamed("getscripthistory", {{"descriptor", "addr(1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa)"}, {"start_height", 0}, {"end_height", 1000}, {"include_mempool", false}})
         },
         [](const RPCMethod& self, const JSONRPCRequest& request) -> UniValue {
-            if (!g_scriptpubkeyindex) {
-                throw JSONRPCError(RPC_MISC_ERROR, "scriptpubkeyindex is not enabled. Run with -scriptpubkeyindex.");
+            if (!g_txoscriptindex) {
+                throw JSONRPCError(RPC_MISC_ERROR, "txoscriptindex is not enabled. Run with -txoscriptindex.");
             }
             const UniValue options{request.params[2].isNull() ? UniValue::VOBJ : request.params[2]};
             RPCTypeCheckObj(options,
@@ -3868,13 +3868,13 @@ static RPCMethod getscripthistory()
                 FlatSigningProvider provider;
                 for (const CScript& script : EvalDescriptorStringOrObject(scan_object, provider)) scripts.insert(script);
             }
-            for (const CScript& script : scripts) script_hashes.insert(scriptpubkeyindex::Sha256ScriptPubKey(script));
+            for (const CScript& script : scripts) script_hashes.insert(txoscriptindex::Sha256ScriptPubKey(script));
 
             const NodeContext& node{EnsureAnyNodeContext(request.context)};
             ChainstateManager& chainman{EnsureChainman(node)};
             const CBlockIndex* tip{WITH_LOCK(cs_main, return chainman.ActiveChain().Tip())};
-            if (!g_scriptpubkeyindex->BlockUntilSyncedToCurrentChain()) {
-                throw JSONRPCError(RPC_MISC_ERROR, "scriptpubkeyindex is still syncing.");
+            if (!g_txoscriptindex->BlockUntilSyncedToCurrentChain()) {
+                throw JSONRPCError(RPC_MISC_ERROR, "txoscriptindex is still syncing.");
             }
             const int32_t end_height{requested_end_height.value_or(tip->nHeight)};
 
@@ -3887,7 +3887,7 @@ static RPCMethod getscripthistory()
             {
                 std::map<std::pair<int32_t, uint32_t>, ScriptHistoryTransaction> by_position;
                 for (const uint256& hash : script_hashes) {
-                    auto result{g_scriptpubkeyindex->Find(hash, start_height, end_height, [&](const CTransaction& tx, const uint256& block_hash) {
+                    auto result{g_txoscriptindex->Find(hash, start_height, end_height, [&](const CTransaction& tx, const uint256& block_hash) {
                         budget.Add(tx, block_hash, BudgetSource::CONFIRMED_MATCH);
                     })};
                     if (!result) throw JSONRPCError(RPC_MISC_ERROR, result.error());
@@ -3929,7 +3929,7 @@ static RPCMethod getscripthistory()
                     ScriptHistoryTransaction match{tx, std::nullopt, {}};
                     for (const uint32_t index : std::views::iota(uint32_t{0}, tx->vout.size())) {
                         const CScript& script{tx->vout[index].scriptPubKey};
-                        if (scripts.empty() ? script_hashes.contains(scriptpubkeyindex::Sha256ScriptPubKey(script)) : scripts.contains(script)) {
+                        if (scripts.empty() ? script_hashes.contains(txoscriptindex::Sha256ScriptPubKey(script)) : scripts.contains(script)) {
                             match.outputs.emplace_back(index);
                         }
                     }

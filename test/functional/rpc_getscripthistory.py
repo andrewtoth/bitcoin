@@ -2,7 +2,7 @@
 # Copyright (c) The Bitcoin Core developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
-"""Test getscripthistory RPC and scriptpubkeyindex."""
+"""Test getscripthistory RPC and txoscriptindex."""
 
 import hashlib
 from copy import deepcopy
@@ -40,7 +40,7 @@ def spending_by_id(history):
 class GetScriptHistoryTest(BitcoinTestFramework):
     def set_test_params(self):
         self.num_nodes = 1
-        self.extra_args = [["-scriptpubkeyindex", "-txospenderindex", "-txindex"]]
+        self.extra_args = [["-txoscriptindex", "-txospenderindex", "-txindex"]]
 
     def wait_for_indexes(self, node):
         self.wait_until(lambda: all(i["synced"] for i in node.getindexinfo().values()))
@@ -238,7 +238,7 @@ class GetScriptHistoryTest(BitcoinTestFramework):
 
         self.log.info("Index is required")
         self.restart_node(0, extra_args=[])
-        assert_raises_rpc_error(-1, "scriptpubkeyindex is not enabled", node0.getscripthistory, "00" * 32)
+        assert_raises_rpc_error(-1, "txoscriptindex is not enabled", node0.getscripthistory, "00" * 32)
         self.restart_node(0, extra_args=self.extra_args[0])
         self.wallet.rescan_utxos()
         self.wait_for_indexes(node0)
@@ -432,7 +432,7 @@ class GetScriptHistoryTest(BitcoinTestFramework):
         self.test_unspendable_outputs(node0)
 
         self.log.info("Confirmed spenders need txospenderindex unless they are themselves scriptPubKey hits")
-        self.restart_node(0, extra_args=["-scriptpubkeyindex", "-txindex"])
+        self.restart_node(0, extra_args=["-txoscriptindex", "-txindex"])
         self.wait_for_indexes(node0)
         history = node0.getscripthistory(sh, 1)
         by_id = txs_by_id(history)
@@ -469,10 +469,10 @@ class GetScriptHistoryTest(BitcoinTestFramework):
         self.check_omitted_spenders(node0, sh)
         self.test_serialized_size_limit(node0)
 
-        self.log.info("Pruned script history works with only scriptpubkeyindex enabled")
-        self.restart_node(0, extra_args=["-scriptpubkeyindex", "-txospenderindex=0", "-txindex=0", "-prune=1", "-fastprune"])
+        self.log.info("Pruned script history works with only txoscriptindex enabled")
+        self.restart_node(0, extra_args=["-txoscriptindex", "-txospenderindex=0", "-txindex=0", "-prune=1", "-fastprune"])
         self.wait_for_indexes(node0)
-        assert_equal(set(node0.getindexinfo()), {"scriptpubkeyindex"})
+        assert_equal(set(node0.getindexinfo()), {"txoscriptindex"})
         old_range = {"start_height": pay_height, "end_height": pay_height, "include_mempool": False}
         assert pay["txid"] in txs_by_id(node0.getscripthistory(sh, 0, old_range))
 

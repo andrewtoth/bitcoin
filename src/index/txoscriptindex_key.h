@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_INDEX_SCRIPTPUBKEYINDEX_KEY_H
-#define BITCOIN_INDEX_SCRIPTPUBKEYINDEX_KEY_H
+#ifndef BITCOIN_INDEX_TXOSCRIPTINDEX_KEY_H
+#define BITCOIN_INDEX_TXOSCRIPTINDEX_KEY_H
 
 #include <consensus/consensus.h>
 #include <crypto/siphash.h>
@@ -18,7 +18,7 @@
 #include <string>
 
 // Internal format shared with encoding and collision-injection tests.
-namespace scriptpubkeyindex {
+namespace txoscriptindex {
 /*
  * Database layout:
  *
@@ -31,7 +31,7 @@ namespace scriptpubkeyindex {
  * One key is stored per distinct prefix in a transaction (not per output).
  */
 
-constexpr uint8_t DB_SCRIPTPUBKEYINDEX{'x'};
+constexpr uint8_t DB_TXOSCRIPTINDEX{'x'};
 inline const std::string DB_SPK_HASH_SALT{"spk_hash_salt"};
 
 inline constexpr std::array<std::byte, 0> EMPTY_VALUE{};
@@ -56,10 +56,10 @@ struct DBKey {
 
     SERIALIZE_METHODS(DBKey, obj)
     {
-        uint8_t prefix{DB_SCRIPTPUBKEYINDEX};
+        uint8_t prefix{DB_TXOSCRIPTINDEX};
         READWRITE(prefix);
-        if (ser_action.ForRead() && prefix != DB_SCRIPTPUBKEYINDEX) {
-            throw std::ios_base::failure("Invalid format for scriptpubkeyindex DB key");
+        if (ser_action.ForRead() && prefix != DB_TXOSCRIPTINDEX) {
+            throw std::ios_base::failure("Invalid format for txoscriptindex DB key");
         }
         READWRITE(Using<BigEndianFormatter<HASH_PREFIX_SIZE>>(obj.hash_prefix),
                   Using<OrderedVarIntFormatter>(obj.height),
@@ -67,6 +67,6 @@ struct DBKey {
     }
 };
 
-} // namespace scriptpubkeyindex
+} // namespace txoscriptindex
 
-#endif // BITCOIN_INDEX_SCRIPTPUBKEYINDEX_KEY_H
+#endif // BITCOIN_INDEX_TXOSCRIPTINDEX_KEY_H

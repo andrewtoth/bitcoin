@@ -12,7 +12,7 @@
 #include <index/blockfilterindex.h>
 #include <index/coinstatsindex.h>
 #include <index/txindex.h>
-#include <index/scriptpubkeyindex.h>
+#include <index/txoscriptindex.h>
 #include <index/txospenderindex.h>
 #include <interfaces/chain.h>
 #include <interfaces/echo.h>
@@ -412,8 +412,8 @@ static RPCMethod getindexinfo()
         result.pushKVs(SummaryToJSON(g_txospenderindex->GetSummary(), index_name));
     }
 
-    if (g_scriptpubkeyindex) {
-        result.pushKVs(SummaryToJSON(g_scriptpubkeyindex->GetSummary(), index_name));
+    if (g_txoscriptindex) {
+        result.pushKVs(SummaryToJSON(g_txoscriptindex->GetSummary(), index_name));
     }
 
     ForEachBlockFilterIndex([&result, &index_name](const BlockFilterIndex& index) {

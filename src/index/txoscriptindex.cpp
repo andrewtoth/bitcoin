@@ -2,7 +2,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#include <index/scriptpubkeyindex.h>
+#include <index/txoscriptindex.h>
 
 #include <chain.h>
 #include <common/args.h>
@@ -10,7 +10,7 @@
 #include <dbwrapper.h>
 #include <flatfile.h>
 #include <index/base.h>
-#include <index/scriptpubkeyindex_key.h>
+#include <index/txoscriptindex_key.h>
 #include <interfaces/chain.h>
 #include <node/blockstorage.h>
 #include <primitives/block.h>
@@ -35,30 +35,30 @@
 #include <utility>
 #include <vector>
 
-std::unique_ptr<ScriptPubKeyIndex> g_scriptpubkeyindex;
+std::unique_ptr<TxoScriptIndex> g_txoscriptindex;
 
 namespace {
 SipHasher13UJ ReadOrCreateHasher(CDBWrapper& db)
 {
     std::pair<uint64_t, uint64_t> salt;
-    if (!db.Read(scriptpubkeyindex::DB_SPK_HASH_SALT, salt)) {
+    if (!db.Read(txoscriptindex::DB_SPK_HASH_SALT, salt)) {
         FastRandomContext rng{};
         salt = {rng.rand64(), rng.rand64()};
-        db.Write(scriptpubkeyindex::DB_SPK_HASH_SALT, salt, /*fSync=*/true);
+        db.Write(txoscriptindex::DB_SPK_HASH_SALT, salt, /*fSync=*/true);
     }
     return SipHasher13UJ{salt.first, salt.second};
 }
 
-std::vector<scriptpubkeyindex::DBKey> BuildKeys(const SipHasher13UJ& hasher, const interfaces::BlockInfo& block)
+std::vector<txoscriptindex::DBKey> BuildKeys(const SipHasher13UJ& hasher, const interfaces::BlockInfo& block)
 {
     assert(block.data);
     assert(block.height >= 0);
-    std::vector<scriptpubkeyindex::DBKey> keys;
-    uint32_t tx_offset_in_block{scriptpubkeyindex::BLOCK_HEADER_SIZE + GetSizeOfCompactSize(block.data->vtx.size())};
+    std::vector<txoscriptindex::DBKey> keys;
+    uint32_t tx_offset_in_block{txoscriptindex::BLOCK_HEADER_SIZE + GetSizeOfCompactSize(block.data->vtx.size())};
     for (const auto& tx : block.data->vtx) {
-        std::set<scriptpubkeyindex::HashPrefix> prefixes;
+        std::set<txoscriptindex::HashPrefix> prefixes;
         for (const auto& output : tx->vout) {
-            prefixes.insert(scriptpubkeyindex::CreateKeyPrefix(hasher, scriptpubkeyindex::Sha256ScriptPubKey(output.scriptPubKey)));
+            prefixes.insert(txoscriptindex::CreateKeyPrefix(hasher, txoscriptindex::Sha256ScriptPubKey(output.scriptPubKey)));
         }
         for (const auto prefix : prefixes) {
             keys.emplace_back(prefix, static_cast<uint32_t>(block.height), tx_offset_in_block);
@@ -69,26 +69,26 @@ std::vector<scriptpubkeyindex::DBKey> BuildKeys(const SipHasher13UJ& hasher, con
 }
 } // namespace
 
-class ScriptPubKeyIndex::DB : public BaseIndex::DB
+class TxoScriptIndex::DB : public BaseIndex::DB
 {
 public:
     explicit DB(size_t cache_size, bool memory, bool wipe)
-        : BaseIndex::DB(gArgs.GetDataDirNet() / "indexes" / "scriptpubkeyindex", cache_size, memory, wipe, /*f_obfuscate=*/false, /*f_bloom=*/false),
+        : BaseIndex::DB(gArgs.GetDataDirNet() / "indexes" / "txoscriptindex", cache_size, memory, wipe, /*f_obfuscate=*/false, /*f_bloom=*/false),
           m_hasher{ReadOrCreateHasher(*this)}
     {}
 
     const SipHasher13UJ m_hasher;
 
-    void WriteKeys(const std::vector<scriptpubkeyindex::DBKey>& keys)
+    void WriteKeys(const std::vector<txoscriptindex::DBKey>& keys)
     {
         CDBBatch batch{*this};
         for (const auto& key : keys) {
-            batch.Write(key, scriptpubkeyindex::EMPTY_VALUE);
+            batch.Write(key, txoscriptindex::EMPTY_VALUE);
         }
         WriteBatch(batch);
     }
 
-    void EraseKeys(const std::vector<scriptpubkeyindex::DBKey>& keys)
+    void EraseKeys(const std::vector<txoscriptindex::DBKey>& keys)
     {
         CDBBatch batch{*this};
         for (const auto& key : keys) {
@@ -98,44 +98,44 @@ public:
     }
 };
 
-ScriptPubKeyIndex::ScriptPubKeyIndex(std::unique_ptr<interfaces::Chain> chain, size_t cache_size, bool memory, bool wipe)
-    : BaseIndex(std::move(chain), "scriptpubkeyindex", "spkidx"), m_db{std::make_unique<DB>(cache_size, memory, wipe)}
+TxoScriptIndex::TxoScriptIndex(std::unique_ptr<interfaces::Chain> chain, size_t cache_size, bool memory, bool wipe)
+    : BaseIndex(std::move(chain), "txoscriptindex", "txoscriptidx"), m_db{std::make_unique<DB>(cache_size, memory, wipe)}
 {}
 
-ScriptPubKeyIndex::~ScriptPubKeyIndex() = default;
+TxoScriptIndex::~TxoScriptIndex() = default;
 
-interfaces::Chain::NotifyOptions ScriptPubKeyIndex::CustomOptions()
+interfaces::Chain::NotifyOptions TxoScriptIndex::CustomOptions()
 {
     interfaces::Chain::NotifyOptions options;
     options.disconnect_data = true;
     return options;
 }
 
-bool ScriptPubKeyIndex::CustomAppend(const interfaces::BlockInfo& block)
+bool TxoScriptIndex::CustomAppend(const interfaces::BlockInfo& block)
 {
     m_db->WriteKeys(BuildKeys(m_db->m_hasher, block));
     return true;
 }
 
-bool ScriptPubKeyIndex::CustomRemove(const interfaces::BlockInfo& block)
+bool TxoScriptIndex::CustomRemove(const interfaces::BlockInfo& block)
 {
     m_db->EraseKeys(BuildKeys(m_db->m_hasher, block));
     return true;
 }
 
-BaseIndex::DB& ScriptPubKeyIndex::GetDB() const { return *m_db; }
+BaseIndex::DB& TxoScriptIndex::GetDB() const { return *m_db; }
 
-util::Expected<std::vector<ScriptHistoryMatch>, std::string> ScriptPubKeyIndex::Find(const uint256& script_hash, int32_t start_height, int32_t end_height, const std::function<void(const CTransaction&, const uint256&)>& on_match) const
+util::Expected<std::vector<ScriptHistoryMatch>, std::string> TxoScriptIndex::Find(const uint256& script_hash, int32_t start_height, int32_t end_height, const std::function<void(const CTransaction&, const uint256&)>& on_match) const
 {
     if (start_height < 0 || end_height < start_height) return {};
 
-    const scriptpubkeyindex::HashPrefix prefix{scriptpubkeyindex::CreateKeyPrefix(m_db->m_hasher, script_hash)};
+    const txoscriptindex::HashPrefix prefix{txoscriptindex::CreateKeyPrefix(m_db->m_hasher, script_hash)};
     std::vector<ScriptHistoryMatch> matches;
     std::set<uint256> pruned_blocks;
     const std::unique_ptr<CDBIterator> it{m_db->NewIterator()};
-    scriptpubkeyindex::DBKey key{prefix, static_cast<uint32_t>(start_height), /*tx_offset_in_block=*/0};
+    txoscriptindex::DBKey key{prefix, static_cast<uint32_t>(start_height), /*tx_offset_in_block=*/0};
     for (it->Seek(key); it->Valid(); it->Next()) {
-        if (!it->GetKey(key)) return util::Unexpected("Invalid scriptpubkeyindex key");
+        if (!it->GetKey(key)) return util::Unexpected("Invalid txoscriptindex key");
         if (key.hash_prefix != prefix || key.height > static_cast<uint32_t>(end_height)) break;
 
         FlatFilePos tx_pos;
@@ -157,17 +157,17 @@ util::Expected<std::vector<ScriptHistoryMatch>, std::string> ScriptPubKeyIndex::
         }
         AutoFile file{m_chainstate->m_blockman.OpenBlockFile(tx_pos, /*fReadOnly=*/true)};
         if (file.IsNull()) {
-            return util::Unexpected("Unable to read scriptpubkeyindex transaction in block " + block_hash.ToString() + ": OpenBlockFile failed");
+            return util::Unexpected("Unable to read txoscriptindex transaction in block " + block_hash.ToString() + ": OpenBlockFile failed");
         }
         CTransactionRef tx;
         try {
             file >> TX_WITH_WITNESS(tx);
         } catch (const std::exception& e) {
-            return util::Unexpected("Unable to read scriptpubkeyindex transaction in block " + block_hash.ToString() + ": " + e.what());
+            return util::Unexpected("Unable to read txoscriptindex transaction in block " + block_hash.ToString() + ": " + e.what());
         }
         std::vector<uint32_t> outputs;
         for (const uint32_t index : std::views::iota(uint32_t{0}, tx->vout.size())) {
-            if (scriptpubkeyindex::Sha256ScriptPubKey(tx->vout[index].scriptPubKey) == script_hash) {
+            if (txoscriptindex::Sha256ScriptPubKey(tx->vout[index].scriptPubKey) == script_hash) {
                 outputs.push_back(index);
             }
         }
