@@ -11,10 +11,10 @@
 #include <script/script.h>
 #include <uint256.h>
 #include <util/expected.h>
+#include <util/not_null.h>
 
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -64,7 +64,7 @@ protected:
     class DB;
 
 private:
-    const std::unique_ptr<DB> m_db;
+    const util::NotNullUniquePtr<DB> m_db;
 
     bool AllowPrune() const override { return true; }
 
@@ -85,17 +85,18 @@ public:
     /**
      * Search the index for confirmed transactions with outputs matching the given script hash.
      *
-     * @param[in]     script_hash   SHA256 of the scriptPubKey to search for.
-     * @param[in]     start_height  First block height to search (inclusive).
-     * @param[in]     end_height    Last block height to search (inclusive).
-     * @param[in]     on_match      Callback invoked with each verified matching transaction and its block hash.
+     * @param[in]     script_hash      SHA256 of the scriptPubKey to search for.
+     * @param[in]     start_height     First block height to search (inclusive).
+     * @param[in]     end_height       Last block height to search (inclusive).
+     * @param[in,out] remaining_bytes  Remaining lookup budget, decremented for serialized visited keys and
+     *                                candidate transactions, including repeated reads, false positives,
+     *                                and keys for pruned blocks. Transaction bytes are charged after reading,
+     *                                before checking script hashes.
      *
      * @return  Matches in block height and transaction position order (empty if none).
-     *          util::Unexpected{error} if an index key or transaction could not be read.
-     *
-     * Exceptions thrown by on_match propagate to the caller unchanged.
+     *          util::Unexpected{error} if an index key or transaction could not be read, or the budget is exceeded.
      */
-    util::Expected<std::vector<ScriptHistoryMatch>, std::string> Find(const uint256& script_hash, int32_t start_height, int32_t end_height, const std::function<void(const CTransaction&, const uint256&)>& on_match) const;
+    util::Expected<std::vector<ScriptHistoryMatch>, std::string> Find(const uint256& script_hash, int32_t start_height, int32_t end_height, uint64_t& remaining_bytes) const;
 };
 
 extern std::unique_ptr<TxoScriptIndex> g_txoscriptindex;

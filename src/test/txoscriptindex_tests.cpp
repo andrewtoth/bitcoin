@@ -56,8 +56,6 @@ static uint64_t DecodeOrderedVarInt(const std::vector<std::byte>& bytes)
     return value;
 }
 
-static void IgnoreMatch(const CTransaction&, const uint256&) {}
-
 BOOST_AUTO_TEST_CASE(ordered_varint_exact_encoding_and_roundtrip)
 {
     const struct {
@@ -133,12 +131,13 @@ BOOST_FIXTURE_TEST_CASE(txoscriptindex_initial_sync, TestChain100Setup)
     const uint256 script_hash{txoscriptindex::Sha256ScriptPubKey(coinbase_script)};
     const int32_t tip_height{WITH_LOCK(::cs_main, return m_node.chainman->ActiveHeight())};
 
+    uint64_t remaining_bytes{50_MiB};
     TxoScriptIndex index{interfaces::MakeChain(m_node), 1_MiB, /*memory=*/true};
     BOOST_REQUIRE(index.Init());
-    BOOST_CHECK(index.Find(script_hash, /*start_height=*/0, tip_height, IgnoreMatch).value().empty());
+    BOOST_CHECK(index.Find(script_hash, /*start_height=*/0, tip_height, remaining_bytes).value().empty());
 
     index.Sync();
-    const auto all{index.Find(script_hash, /*start_height=*/0, tip_height, IgnoreMatch).value()};
+    const auto all{index.Find(script_hash, /*start_height=*/0, tip_height, remaining_bytes).value()};
     BOOST_CHECK_EQUAL(all.size(), m_coinbase_txns.size());
     for (const auto& match : all) {
         BOOST_REQUIRE(match.tx);
@@ -146,15 +145,15 @@ BOOST_FIXTURE_TEST_CASE(txoscriptindex_initial_sync, TestChain100Setup)
         BOOST_CHECK(match.tx->vout[match.outputs[0]].scriptPubKey == coinbase_script);
     }
 
-    const auto ranged{index.Find(script_hash, /*start_height=*/90, /*end_height=*/95, IgnoreMatch).value()};
+    const auto ranged{index.Find(script_hash, /*start_height=*/90, /*end_height=*/95, remaining_bytes).value()};
     BOOST_REQUIRE_EQUAL(ranged.size(), 6);
     for (const auto& match : ranged) {
         BOOST_CHECK_GE(match.height, 90);
         BOOST_CHECK_LE(match.height, 95);
     }
 
-    BOOST_CHECK(index.Find(script_hash, -1, 95, IgnoreMatch).value().empty());
-    BOOST_CHECK(index.Find(script_hash, 95, 90, IgnoreMatch).value().empty());
+    BOOST_CHECK(index.Find(script_hash, -1, 95, remaining_bytes).value().empty());
+    BOOST_CHECK(index.Find(script_hash, 95, 90, remaining_bytes).value().empty());
 
     index.Stop();
 }
@@ -167,12 +166,7 @@ BOOST_FIXTURE_TEST_CASE(txoscriptindex_collisions_and_pruned_blocks, TestChain10
     const auto second_block{CreateAndProcessBlock({}, target_script)};
     m_node.validation_signals->SyncWithValidationInterfaceQueue();
 
-    size_t callbacks{0};
-    const auto on_match{[&](const CTransaction& tx, const uint256& block_hash) {
-        BOOST_CHECK(tx.GetHash() == first_block.vtx[0]->GetHash() || tx.GetHash() == second_block.vtx[0]->GetHash());
-        BOOST_CHECK(block_hash == first_block.GetHash() || block_hash == second_block.GetHash());
-        ++callbacks;
-    }};
+    uint64_t remaining_bytes{50_MiB};
     TxoScriptIndex index{interfaces::MakeChain(m_node), 1_MiB, /*memory=*/true};
     BOOST_REQUIRE(index.Init());
     index.Sync();
@@ -191,7 +185,7 @@ BOOST_FIXTURE_TEST_CASE(txoscriptindex_collisions_and_pruned_blocks, TestChain10
     CBlockIndex* pruned_block{WITH_LOCK(cs_main, return m_node.chainman->ActiveChain()[3])};
     const auto original_status{WITH_LOCK(cs_main, return pruned_block->nStatus)};
     WITH_LOCK(cs_main, pruned_block->nStatus &= ~BLOCK_HAVE_DATA);
-    const auto matches{index.Find(script_hash, 0, 102, on_match).value()};
+    const auto matches{index.Find(script_hash, 0, 102, remaining_bytes).value()};
     BOOST_REQUIRE_EQUAL(matches.size(), 3);
     BOOST_CHECK(!matches[0].tx);
     BOOST_CHECK(matches[0].block_hash == pruned_block->GetBlockHash());
@@ -200,9 +194,7 @@ BOOST_FIXTURE_TEST_CASE(txoscriptindex_collisions_and_pruned_blocks, TestChain10
     BOOST_CHECK(matches[0].outputs.empty());
     BOOST_CHECK(matches[1].tx->GetHash() == first_block.vtx[0]->GetHash());
     BOOST_CHECK(matches[2].tx->GetHash() == second_block.vtx[0]->GetHash());
-    BOOST_CHECK_EQUAL(callbacks, 2);
-    BOOST_CHECK_EQUAL(index.Find(script_hash, 0, 100, on_match).value().size(), 1);
-    BOOST_CHECK_EQUAL(callbacks, 2);
+    BOOST_CHECK_EQUAL(index.Find(script_hash, 0, 100, remaining_bytes).value().size(), 1);
     WITH_LOCK(cs_main, pruned_block->nStatus = original_status);
     index.Stop();
 }
@@ -210,6 +202,7 @@ BOOST_FIXTURE_TEST_CASE(txoscriptindex_collisions_and_pruned_blocks, TestChain10
 BOOST_FIXTURE_TEST_CASE(txoscriptindex_read_failures, TestChain100Setup)
 {
     const uint256 script_hash{txoscriptindex::Sha256ScriptPubKey(m_coinbase_txns[0]->vout[0].scriptPubKey)};
+    uint64_t remaining_bytes{50_MiB};
     TxoScriptIndex index{interfaces::MakeChain(m_node), 1_MiB, /*memory=*/true};
     BOOST_REQUIRE(index.Init());
     index.Sync();
@@ -217,7 +210,7 @@ BOOST_FIXTURE_TEST_CASE(txoscriptindex_read_failures, TestChain100Setup)
     const auto original_file{WITH_LOCK(cs_main, return block->nFile)};
     WITH_LOCK(cs_main, block->nFile = std::numeric_limits<decltype(block->nFile)>::max());
     {
-        const auto result{index.Find(script_hash, 1, 1, IgnoreMatch)};
+        const auto result{index.Find(script_hash, 1, 1, remaining_bytes)};
         BOOST_REQUIRE(!result);
         BOOST_CHECK(result.error().starts_with("Unable to read txoscriptindex transaction in block " + block->GetBlockHash().ToString() + ": "));
     }
@@ -228,12 +221,12 @@ BOOST_FIXTURE_TEST_CASE(txoscriptindex_read_failures, TestChain100Setup)
     const auto original_pos{WITH_LOCK(cs_main, return block->nDataPos)};
     WITH_LOCK(cs_main, block->nDataPos = 1U << 30);
     {
-        const auto result{index.Find(script_hash, 1, 1, IgnoreMatch)};
+        const auto result{index.Find(script_hash, 1, 1, remaining_bytes)};
         BOOST_REQUIRE(!result);
         BOOST_CHECK(result.error().starts_with("Unable to read txoscriptindex transaction in block " + block->GetBlockHash().ToString() + ": "));
     }
     WITH_LOCK(cs_main, block->nDataPos = original_pos);
-    BOOST_CHECK_EQUAL(index.Find(script_hash, 1, 1, IgnoreMatch).value().size(), 1);
+    BOOST_CHECK_EQUAL(index.Find(script_hash, 1, 1, remaining_bytes).value().size(), 1);
     index.Stop();
 }
 
@@ -256,14 +249,14 @@ BOOST_FIXTURE_TEST_CASE(txoscriptindex_multi_output, TestChain100Setup)
     tx.vin[0].scriptSig << signature;
 
     const auto block{CreateAndProcessBlock({tx}, coinbase_script)};
-    const uint256 tip_hash{block.GetHash()};
     m_node.validation_signals->SyncWithValidationInterfaceQueue();
 
+    uint64_t remaining_bytes{50_MiB};
     TxoScriptIndex index{interfaces::MakeChain(m_node), 1_MiB, /*memory=*/true};
     BOOST_REQUIRE(index.Init());
     index.Sync();
     const int32_t tip_height{WITH_LOCK(::cs_main, return m_node.chainman->ActiveHeight())};
-    const auto matches{index.Find(txoscriptindex::Sha256ScriptPubKey(dest_script), /*start_height=*/0, tip_height, IgnoreMatch).value()};
+    const auto matches{index.Find(txoscriptindex::Sha256ScriptPubKey(dest_script), /*start_height=*/0, tip_height, remaining_bytes).value()};
     BOOST_REQUIRE_EQUAL(matches.size(), 1);
     BOOST_REQUIRE(matches[0].tx);
     BOOST_CHECK(matches[0].tx->GetHash() == tx.GetHash());
@@ -272,50 +265,75 @@ BOOST_FIXTURE_TEST_CASE(txoscriptindex_multi_output, TestChain100Setup)
     BOOST_CHECK_EQUAL(matches[0].outputs[0], 0);
     BOOST_CHECK_EQUAL(matches[0].outputs[1], 1);
 
-    // Each query must invoke the callback, even for another script in the same
-    // transaction or a repeated lookup.
-    size_t callbacks{0};
-    const auto on_match{[&](const CTransaction& match, const uint256& block_hash) {
-        BOOST_CHECK(match.GetHash() == tx.GetHash());
-        BOOST_CHECK(block_hash == tip_hash);
-        ++callbacks;
-    }};
-    const auto repeated{index.Find(txoscriptindex::Sha256ScriptPubKey(dest_script), 0, tip_height, on_match).value()};
+    // A shared work budget charges each read, even for repeated transactions
+    // or a second script in the same transaction.
+    const uint64_t tx_bytes{CTransaction{tx}.ComputeTotalSize()};
+    const uint64_t before_repeated{remaining_bytes};
+    const auto repeated{index.Find(txoscriptindex::Sha256ScriptPubKey(dest_script), 0, tip_height, remaining_bytes).value()};
     BOOST_REQUIRE_EQUAL(repeated.size(), 1);
     BOOST_CHECK(repeated[0].outputs == matches[0].outputs);
-    const auto other_script{index.Find(txoscriptindex::Sha256ScriptPubKey(tx.vout[2].scriptPubKey), 0, tip_height, on_match).value()};
+    BOOST_CHECK_GT(before_repeated - remaining_bytes, tx_bytes);
+    const uint64_t before_other_script{remaining_bytes};
+    const auto other_script{index.Find(txoscriptindex::Sha256ScriptPubKey(tx.vout[2].scriptPubKey), 0, tip_height, remaining_bytes).value()};
     BOOST_REQUIRE_EQUAL(other_script.size(), 1);
     BOOST_REQUIRE_EQUAL(other_script[0].outputs.size(), 1);
     BOOST_CHECK_EQUAL(other_script[0].outputs[0], 2);
-    BOOST_CHECK_EQUAL(callbacks, 2);
+    BOOST_CHECK_GT(before_other_script - remaining_bytes, tx_bytes);
     index.Stop();
 }
 
-BOOST_FIXTURE_TEST_CASE(txoscriptindex_callback_stops_lookup, TestChain100Setup)
+BOOST_FIXTURE_TEST_CASE(txoscriptindex_false_positive_budget, TestChain100Setup)
 {
-    const uint256 script_hash{txoscriptindex::Sha256ScriptPubKey(m_coinbase_txns[0]->vout[0].scriptPubKey)};
+    const uint256 script_hash{txoscriptindex::Sha256ScriptPubKey(CScript() << OP_TRUE)};
+    uint64_t remaining_bytes{50_MiB};
     TxoScriptIndex index{interfaces::MakeChain(m_node), 1_MiB, /*memory=*/true};
     BOOST_REQUIRE(index.Init());
     index.Sync();
+    CDBWrapper& db{TxoScriptIndexTest::GetDB(index)};
+    std::pair<uint64_t, uint64_t> salt;
+    BOOST_REQUIRE(db.Read(txoscriptindex::DB_SPK_HASH_SALT, salt));
+    const auto prefix{txoscriptindex::CreateKeyPrefix(SipHasher13UJ{salt.first, salt.second}, script_hash)};
+    for (uint32_t height{1}; height <= 2; ++height) {
+        db.Write(txoscriptindex::DBKey{prefix, height, 81}, txoscriptindex::EMPTY_VALUE);
+    }
 
-    // Reading the third transaction would fail. A callback throwing on the
-    // second must stop before that read and propagate the original exception.
-    CBlockIndex* unreadable{WITH_LOCK(cs_main, return m_node.chainman->ActiveChain()[3])};
+    const uint64_t key_bytes{GetSerializeSize(txoscriptindex::DBKey{prefix, 1, 81})};
+    BOOST_CHECK(index.Find(script_hash, 1, 2, remaining_bytes).value().empty());
+    CBlockIndex* unreadable{WITH_LOCK(cs_main, return m_node.chainman->ActiveChain()[2])};
     const auto original_pos{WITH_LOCK(cs_main, return unreadable->nDataPos)};
     WITH_LOCK(cs_main, unreadable->nDataPos = 1U << 30);
-    struct StopLookup {};
-    size_t callbacks{0};
-    const auto on_match{[&](const CTransaction& tx, const uint256& block_hash) {
-        BOOST_CHECK(tx.GetHash() == m_coinbase_txns[callbacks]->GetHash());
-        BOOST_CHECK(block_hash == WITH_LOCK(cs_main, return m_node.chainman->ActiveChain()[callbacks + 1]->GetBlockHash()));
-        if (++callbacks == 2) throw StopLookup{};
-    }};
-    BOOST_CHECK_THROW(index.Find(script_hash, 1, 100, on_match), StopLookup);
-    BOOST_CHECK_EQUAL(callbacks, 2);
-    const auto result{index.Find(script_hash, 1, 100, IgnoreMatch)};
+    // The first false-positive transaction exceeds the budget. Return the
+    // budget error before attempting to read the unreadable second one.
+    remaining_bytes = key_bytes + m_coinbase_txns[0]->ComputeTotalSize() - 1;
+    auto result{index.Find(script_hash, 1, 2, remaining_bytes)};
     BOOST_REQUIRE(!result);
+    BOOST_CHECK(result.error().starts_with("Script history index lookup limit exceeded while scanning block 1."));
+    BOOST_CHECK_EQUAL(remaining_bytes, m_coinbase_txns[0]->ComputeTotalSize() - 1);
+
+    // Each pruned candidate still costs a key visit. Stop before reaching the
+    // unreadable second block, rather than treating pruned entries as free.
+    CBlockIndex* pruned{WITH_LOCK(cs_main, return m_node.chainman->ActiveChain()[1])};
+    const auto original_status{WITH_LOCK(cs_main, return pruned->nStatus)};
+    WITH_LOCK(cs_main, pruned->nStatus &= ~BLOCK_HAVE_DATA);
+    remaining_bytes = key_bytes;
+    result = index.Find(script_hash, 1, 2, remaining_bytes);
+    BOOST_REQUIRE(!result);
+    BOOST_CHECK(result.error().starts_with("Script history index lookup limit exceeded while scanning block 2."));
+    BOOST_CHECK_EQUAL(remaining_bytes, 0);
+    WITH_LOCK(cs_main, pruned->nStatus = original_status);
     WITH_LOCK(cs_main, unreadable->nDataPos = original_pos);
-    BOOST_CHECK_EQUAL(index.Find(script_hash, 1, 100, IgnoreMatch).value().size(), 100);
+
+    // A boundary key outside the requested range must not produce a height hint.
+    remaining_bytes = key_bytes + m_coinbase_txns[0]->ComputeTotalSize();
+    result = index.Find(script_hash, 1, 1, remaining_bytes);
+    BOOST_REQUIRE(!result);
+    BOOST_CHECK_EQUAL(result.error(), "Script history index lookup limit exceeded. Narrow the range with start_height/end_height or the descriptor range.");
+
+    // An exact budget succeeds, including the boundary key past the requested range.
+    remaining_bytes = 2 * key_bytes + m_coinbase_txns[0]->ComputeTotalSize();
+    BOOST_CHECK(index.Find(script_hash, 1, 1, remaining_bytes).value().empty());
+    BOOST_CHECK_EQUAL(remaining_bytes, 0);
+
     index.Stop();
 }
 

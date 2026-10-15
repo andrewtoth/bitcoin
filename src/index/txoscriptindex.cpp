@@ -26,11 +26,10 @@
 
 #include <cassert>
 #include <cstdint>
-#include <functional>
+#include <exception>
 #include <memory>
 #include <ranges>
 #include <set>
-#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -125,25 +124,36 @@ bool TxoScriptIndex::CustomRemove(const interfaces::BlockInfo& block)
 
 BaseIndex::DB& TxoScriptIndex::GetDB() const { return *m_db; }
 
-util::Expected<std::vector<ScriptHistoryMatch>, std::string> TxoScriptIndex::Find(const uint256& script_hash, int32_t start_height, int32_t end_height, const std::function<void(const CTransaction&, const uint256&)>& on_match) const
+util::Expected<std::vector<ScriptHistoryMatch>, std::string> TxoScriptIndex::Find(const uint256& script_hash, int32_t start_height, int32_t end_height, uint64_t& remaining_bytes) const
 {
     if (start_height < 0 || end_height < start_height) return {};
 
     const txoscriptindex::HashPrefix prefix{txoscriptindex::CreateKeyPrefix(m_db->m_hasher, script_hash)};
+    const auto budget_error{[&](const txoscriptindex::DBKey& key) {
+        std::string error{"Script history index lookup limit exceeded"};
+        if (key.hash_prefix == prefix && key.height <= static_cast<uint32_t>(end_height)) {
+            error += " while scanning block " + std::to_string(key.height);
+        }
+        return util::Unexpected(error + ". Narrow the range with start_height/end_height or the descriptor range.");
+    }};
     std::vector<ScriptHistoryMatch> matches;
     std::set<uint256> pruned_blocks;
     const std::unique_ptr<CDBIterator> it{m_db->NewIterator()};
     txoscriptindex::DBKey key{prefix, static_cast<uint32_t>(start_height), /*tx_offset_in_block=*/0};
     for (it->Seek(key); it->Valid(); it->Next()) {
         if (!it->GetKey(key)) return util::Unexpected("Invalid txoscriptindex key");
+        const uint64_t key_bytes{GetSerializeSize(key)};
+        if (key_bytes > remaining_bytes) return budget_error(key);
+        remaining_bytes -= key_bytes;
         if (key.hash_prefix != prefix || key.height > static_cast<uint32_t>(end_height)) break;
 
         FlatFilePos tx_pos;
         uint256 block_hash;
         const int32_t height{static_cast<int32_t>(key.height)};
+        const CBlockIndex* block_index;
         {
             LOCK(cs_main);
-            const CBlockIndex* block_index{m_chainstate->m_chain[key.height]};
+            block_index = m_chainstate->m_chain[key.height];
             if (!block_index) continue;
             block_hash = block_index->GetBlockHash();
             if (block_index->nStatus & BLOCK_HAVE_DATA) {
@@ -157,23 +167,32 @@ util::Expected<std::vector<ScriptHistoryMatch>, std::string> TxoScriptIndex::Fin
         }
         AutoFile file{m_chainstate->m_blockman.OpenBlockFile(tx_pos, /*fReadOnly=*/true)};
         if (file.IsNull()) {
+            // Pruning may have removed the file after the availability check.
+            LOCK(cs_main);
+            if (m_chainstate->m_chain.Contains(*block_index) && m_chainstate->m_blockman.IsBlockPruned(*block_index)) {
+                if (pruned_blocks.insert(block_hash).second) {
+                    matches.emplace_back(/*tx=*/nullptr, block_hash, height, std::vector<uint32_t>{});
+                }
+                continue;
+            }
             return util::Unexpected("Unable to read txoscriptindex transaction in block " + block_hash.ToString() + ": OpenBlockFile failed");
         }
-        CTransactionRef tx;
         try {
-            file >> TX_WITH_WITNESS(tx);
+            auto tx{std::make_shared<const CTransaction>(deserialize, TX_WITH_WITNESS, file)};
+            const uint64_t tx_bytes{tx->ComputeTotalSize()};
+            if (tx_bytes > remaining_bytes) return budget_error(key);
+            remaining_bytes -= tx_bytes;
+            std::vector<uint32_t> outputs;
+            for (const uint32_t index : std::views::iota(uint32_t{0}, tx->vout.size())) {
+                if (txoscriptindex::Sha256ScriptPubKey(tx->vout[index].scriptPubKey) == script_hash) {
+                    outputs.push_back(index);
+                }
+            }
+            if (outputs.empty()) continue;
+            matches.emplace_back(std::move(tx), block_hash, height, std::move(outputs), key.tx_offset_in_block);
         } catch (const std::exception& e) {
             return util::Unexpected("Unable to read txoscriptindex transaction in block " + block_hash.ToString() + ": " + e.what());
         }
-        std::vector<uint32_t> outputs;
-        for (const uint32_t index : std::views::iota(uint32_t{0}, tx->vout.size())) {
-            if (txoscriptindex::Sha256ScriptPubKey(tx->vout[index].scriptPubKey) == script_hash) {
-                outputs.push_back(index);
-            }
-        }
-        if (outputs.empty()) continue;
-        on_match(*tx, block_hash);
-        matches.emplace_back(std::move(tx), block_hash, height, std::move(outputs), key.tx_offset_in_block);
     }
     return matches;
 }

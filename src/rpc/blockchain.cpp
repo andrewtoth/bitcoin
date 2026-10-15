@@ -68,6 +68,7 @@
 #include <util/expected.h>
 #include <util/fs.h>
 #include <util/log.h>
+#include <util/not_null.h>
 #include <util/result.h>
 #include <util/string.h>
 #include <util/syserror.h>
@@ -3672,44 +3673,6 @@ return RPCMethod{
 
 namespace {
 constexpr uint64_t MAX_HISTORY_BYTES{50 * 1024 * 1024};
-
-//! A total transaction serialized size budget of all matching txs in one RPC call.
-//! Used to prevent DoS from scripts with very large histories.
-struct ScriptHistoryBudget {
-    const uint64_t max_bytes;
-    uint64_t total_bytes{0};
-    //! Used to count each tx only once when multiple outputs match a single tx.
-    std::set<std::pair<uint256, Txid>> seen;
-
-    explicit ScriptHistoryBudget(uint64_t max_bytes) : max_bytes{max_bytes} {}
-
-    enum class Source { CONFIRMED_MATCH, MEMPOOL_MATCH, EXTRA_SPENDER };
-
-    //! Throw std::runtime_error before exceeding max_bytes
-    void Add(const CTransaction& tx, const uint256& block_hash, Source source)
-    {
-        const auto occurrence{std::pair{block_hash, tx.GetHash()}};
-        if (seen.contains(occurrence)) return;
-        const uint64_t size{tx.ComputeTotalSize()};
-        if (total_bytes > max_bytes || size > max_bytes - total_bytes) {
-            std::string guidance;
-            switch (source) {
-            case Source::CONFIRMED_MATCH:
-                guidance = "Narrow the range with start_height/end_height.";
-                break;
-            case Source::MEMPOOL_MATCH:
-                guidance = "Set include_mempool=false.";
-                break;
-            case Source::EXTRA_SPENDER:
-                guidance = "Set include_spending_transactions=false.";
-                break;
-            }
-            throw std::runtime_error("Script history exceeds the " + std::to_string(max_bytes) + " byte serialized size limit. " + guidance);
-        }
-        seen.insert(occurrence);
-        total_bytes += size;
-    }
-};
 } // namespace
 
 struct ScriptHistoryTransaction {
@@ -3720,7 +3683,7 @@ struct ScriptHistoryTransaction {
 
     struct Output {
         struct Spender {
-            CTransactionRef tx;
+            util::NotNull<CTransactionRef> tx;
             std::optional<Block> block;
         };
 
@@ -3729,7 +3692,7 @@ struct ScriptHistoryTransaction {
         std::optional<Spender> spending{};
     };
 
-    CTransactionRef tx;
+    util::NotNull<CTransactionRef> tx;
     std::optional<Block> block;
     std::vector<Output> outputs;
 };
@@ -3772,6 +3735,10 @@ static RPCMethod getscripthistory()
         "Returns transactions that create outputs matching a scriptPubKey, plus any transactions that spend those outputs.\n"
         "The script may be specified as an address, an output descriptor, or SHA256 of the scriptPubKey (hex-encoded in Bitcoin byte order, same as Electrum scripthash).\n"
         "Requires -txoscriptindex. Confirmed history is served from the index. Unconfirmed matching transactions are found by scanning the mempool.\n"
+        "Unavailable until assumeutxo background validation and index synchronization have completed.\n"
+        "Script index lookups have a shared 50 MiB budget for serialized visited keys and candidate transactions, including repeated reads and false positives. Queries exceeding this limit fail; narrow start_height/end_height or the descriptor range and retry.\n"
+        "A block height reported in a lookup-limit error is a retry hint, not a continuation point; no partial history is returned.\n"
+        "Returned transaction bodies have a separate 50 MiB serialized size limit, including spending transactions. These limits do not measure JSON response size.\n"
         "Spentness is taken from the UTXO set and optionally the mempool when include_mempool=true. Confirmed spending transactions that do not themselves contain scriptPubKey matches are only returned when -txospenderindex is synced and include_spending_transactions=true.\n\n"
         "If verbosity is 0 or omitted, each transaction contains the serialized transaction as hex, plus spentness for matching outputs.\n"
         "If verbosity is 1, each transaction is a JSON Object with the same fields as getrawtransaction verbosity 1, plus spentness for matching outputs.\n"
@@ -3840,7 +3807,6 @@ static RPCMethod getscripthistory()
             }
             const bool include_mempool{options.exists("include_mempool") ? options["include_mempool"].get_bool() : true};
             const bool include_spending_transactions{options.exists("include_spending_transactions") ? options["include_spending_transactions"].get_bool() : true};
-            using BudgetSource = ScriptHistoryBudget::Source;
             const std::optional<int32_t> requested_end_height{options.exists("end_height") ? std::make_optional(options["end_height"].getInt<int32_t>()) : std::nullopt};
             if (requested_end_height && *requested_end_height < start_height) {
                 throw JSONRPCError(RPC_INVALID_PARAMETER, "end_height must be greater than or equal to start_height");
@@ -3872,14 +3838,36 @@ static RPCMethod getscripthistory()
 
             const NodeContext& node{EnsureAnyNodeContext(request.context)};
             ChainstateManager& chainman{EnsureChainman(node)};
-            const CBlockIndex* tip{WITH_LOCK(cs_main, return chainman.ActiveChain().Tip())};
-            if (!g_txoscriptindex->BlockUntilSyncedToCurrentChain()) {
-                throw JSONRPCError(RPC_MISC_ERROR, "txoscriptindex is still syncing.");
+            const bool index_ready{g_txoscriptindex->BlockUntilSyncedToCurrentChain()};
+            const CBlockIndex* tip;
+            {
+                LOCK(cs_main);
+                const Chainstate& chainstate{chainman.CurrentChainstate()};
+                if (chainstate.m_assumeutxo != Assumeutxo::VALIDATED) {
+                    throw JSONRPCError(RPC_MISC_ERROR, "Script history is unavailable until assumeutxo background validation completes.");
+                }
+                tip = chainstate.m_chain.Tip();
+                // The index may still be synced to the background chain while it restarts after snapshot validation.
+                const CBlockIndex* indexed_tip{chainman.m_blockman.LookupBlockIndex(g_txoscriptindex->GetSummary().best_block_hash)};
+                if (!index_ready || !indexed_tip || indexed_tip->GetAncestor(tip->nHeight) != tip) {
+                    throw JSONRPCError(RPC_MISC_ERROR, "txoscriptindex is still syncing.");
+                }
             }
             const int32_t end_height{requested_end_height.value_or(tip->nHeight)};
 
-            // We stop early if we select more than MAX_HISTORY_BYTES worth of txs to return.
-            ScriptHistoryBudget budget{MAX_HISTORY_BYTES};
+            // Count each returned transaction once, returning true for a newly counted transaction.
+            uint64_t remaining_response_bytes{MAX_HISTORY_BYTES};
+            std::set<std::pair<uint256, Txid>> counted_transactions;
+            const auto count_transaction{[&](const CTransaction& tx, const uint256& block_hash, const char* guidance) {
+                if (!counted_transactions.emplace(block_hash, tx.GetHash()).second) return false;
+                const uint64_t size{tx.ComputeTotalSize()};
+                if (size > remaining_response_bytes) {
+                    throw std::runtime_error("Script history exceeds the " + std::to_string(MAX_HISTORY_BYTES) + " byte serialized size limit. " + guidance);
+                }
+                remaining_response_bytes -= size;
+                return true;
+            }};
+            uint64_t remaining_lookup_bytes{MAX_HISTORY_BYTES};
 
             // Find all outputs matching the scripts, and merge them by block height and tx offset (we can't key by txid because of BIP30 duplicates).
             std::vector<ScriptHistoryTransaction> matches;
@@ -3887,21 +3875,20 @@ static RPCMethod getscripthistory()
             {
                 std::map<std::pair<int32_t, uint32_t>, ScriptHistoryTransaction> by_position;
                 for (const uint256& hash : script_hashes) {
-                    auto result{g_txoscriptindex->Find(hash, start_height, end_height, [&](const CTransaction& tx, const uint256& block_hash) {
-                        budget.Add(tx, block_hash, BudgetSource::CONFIRMED_MATCH);
-                    })};
+                    auto result{g_txoscriptindex->Find(hash, start_height, end_height, remaining_lookup_bytes)};
                     if (!result) throw JSONRPCError(RPC_MISC_ERROR, result.error());
                     for (auto& lookup : *result) {
                         if (!lookup.tx) {
                             pruned_blocks.insert(lookup.block_hash);
                             continue;
                         }
-                        const auto it{by_position.try_emplace(std::pair{lookup.height, lookup.tx_offset}, std::move(lookup.tx), ScriptHistoryTransaction::Block{lookup.block_hash, lookup.height}, std::vector<ScriptHistoryTransaction::Output>{}).first};
+                        const auto it{by_position.try_emplace(std::pair{lookup.height, lookup.tx_offset}, util::NotNull{std::move(lookup.tx)}, ScriptHistoryTransaction::Block{lookup.block_hash, lookup.height}, std::vector<ScriptHistoryTransaction::Output>{}).first};
                         for (const uint32_t index : lookup.outputs) it->second.outputs.emplace_back(index);
                     }
                 }
                 matches.reserve(by_position.size());
                 for (auto& [_, match] : by_position) {
+                    count_transaction(*match.tx, match.block->hash, "Narrow the range with start_height/end_height.");
                     std::ranges::sort(match.outputs, {}, &ScriptHistoryTransaction::Output::index);
                     matches.push_back(std::move(match));
                 }
@@ -3921,12 +3908,13 @@ static RPCMethod getscripthistory()
                 }
             }
 
+            std::vector<ScriptHistoryTransaction::Output::Spender> extra_spenders;
             if (CTxMemPool* pool{include_mempool ? node.mempool.get() : nullptr}) {
                 LOCK(pool->cs);
                 // Check the mempool for tx outputs matching the scripts.
                 for (const CTxMemPoolEntry& entry : pool->entryAll()) {
                     const auto& tx{entry.GetSharedTx()};
-                    ScriptHistoryTransaction match{tx, std::nullopt, {}};
+                    ScriptHistoryTransaction match{util::NotNull{tx}, std::nullopt, {}};
                     for (const uint32_t index : std::views::iota(uint32_t{0}, tx->vout.size())) {
                         const CScript& script{tx->vout[index].scriptPubKey};
                         if (scripts.empty() ? script_hashes.contains(txoscriptindex::Sha256ScriptPubKey(script)) : scripts.contains(script)) {
@@ -3934,7 +3922,7 @@ static RPCMethod getscripthistory()
                         }
                     }
                     if (!match.outputs.empty()) {
-                        budget.Add(*tx, uint256{}, BudgetSource::MEMPOOL_MATCH);
+                        count_transaction(*tx, uint256{}, "Set include_mempool=false.");
                         matches.push_back(std::move(match));
                     }
                 }
@@ -3947,8 +3935,8 @@ static RPCMethod getscripthistory()
                         if (const CTransaction* conflict{pool->GetConflictTx(outpoint)}) {
                             output.spent = true;
                             if (include_spending_transactions) {
-                                budget.Add(*conflict, uint256{}, BudgetSource::EXTRA_SPENDER);
-                                output.spending = ScriptHistoryTransaction::Output::Spender{pool->get(conflict->GetHash()), std::nullopt};
+                                output.spending = ScriptHistoryTransaction::Output::Spender{util::NotNull{pool->get(conflict->GetHash())}, std::nullopt};
+                                if (count_transaction(*conflict, uint256{}, "Set include_spending_transactions=false.")) extra_spenders.push_back(*output.spending);
                             }
                         }
                     }
@@ -3956,54 +3944,47 @@ static RPCMethod getscripthistory()
             }
 
             // Collect all spent outputs that are missing their spending tx.
-            std::map<COutPoint, ScriptHistoryTransaction::Output*> unresolved;
+            std::map<COutPoint, ScriptHistoryTransaction::Output*> spent_outputs;
             for (auto& match : matches) {
                 for (auto& output : match.outputs) {
                     if (!output.spent || output.spending) continue;
-                    unresolved.emplace(COutPoint{match.tx->GetHash(), output.index}, &output);
+                    spent_outputs.emplace(COutPoint{match.tx->GetHash(), output.index}, &output);
                 }
             }
 
-            // Resolve spending txs that are matched output's txs.
+            // Resolve all outputs spent by this transaction to avoid repeated spender lookups.
+            const auto resolve_spender{[&](const ScriptHistoryTransaction::Output::Spender& spender) {
+                for (const auto& input : spender.tx->vin) {
+                    const auto it{spent_outputs.find(input.prevout)};
+                    if (it == spent_outputs.end() || it->second->spending) continue;
+                    it->second->spending = spender;
+                }
+            }};
             for (const auto& match : matches) {
-                if (unresolved.empty()) break;
-                for (const auto& input : match.tx->vin) {
-                    const auto it{unresolved.find(input.prevout)};
-                    if (it == unresolved.end()) continue;
-                    it->second->spending = ScriptHistoryTransaction::Output::Spender{match.tx, match.block};
-                    unresolved.erase(it);
-                    if (unresolved.empty()) break;
-                }
+                if (spent_outputs.empty()) break;
+                resolve_spender({match.tx, match.block});
             }
 
-            std::vector<ScriptHistoryTransaction::Output::Spender> extra_spenders;
             if (include_spending_transactions) {
                 // For any remaining outputs with missing spending txs, look up the spending txs via the txospenderindex.
-                if (!unresolved.empty() && g_txospenderindex && g_txospenderindex->BlockUntilSyncedToCurrentChain()) {
-                    for (const auto& [outpoint, output] : unresolved) {
+                if (!spent_outputs.empty() && g_txospenderindex && g_txospenderindex->BlockUntilSyncedToCurrentChain()) {
+                    for (const auto& [outpoint, output] : spent_outputs) {
+                        if (output->spending) continue;
                         const auto result{g_txospenderindex->FindSpender(outpoint)};
                         if (!result) {
                             throw JSONRPCError(RPC_MISC_ERROR, result.error());
                         }
                         if (!result->has_value()) continue;
                         const TxoSpender& spender{result->value()};
-                        budget.Add(*spender.tx, spender.block_hash, BudgetSource::EXTRA_SPENDER);
+                        const bool new_spender{count_transaction(*spender.tx, spender.block_hash, "Set include_spending_transactions=false.")};
                         const CBlockIndex* block_index{WITH_LOCK(cs_main, return chainman.m_blockman.LookupBlockIndex(spender.block_hash))};
                         CHECK_NONFATAL(block_index);
-                        output->spending = ScriptHistoryTransaction::Output::Spender{spender.tx, ScriptHistoryTransaction::Block{spender.block_hash, block_index->nHeight}};
+                        resolve_spender({util::NotNull{spender.tx}, ScriptHistoryTransaction::Block{spender.block_hash, block_index->nHeight}});
+                        if (new_spender) extra_spenders.push_back(*output->spending);
                     }
                 }
 
-                // Collect spending txs that do not have any matching outputs separately, then sort them.
-                std::set<std::pair<uint256, Txid>> seen_transactions;
-                for (const auto& match : matches) seen_transactions.emplace(match.block ? match.block->hash : uint256{}, match.tx->GetHash());
-                for (const auto& match : matches) {
-                    for (const auto& output : match.outputs) {
-                        if (output.spending && seen_transactions.emplace(output.spending->block ? output.spending->block->hash : uint256{}, output.spending->tx->GetHash()).second) {
-                            extra_spenders.push_back(*output.spending);
-                        }
-                    }
-                }
+                // Sort spending txs that do not have any matching outputs.
                 std::ranges::sort(extra_spenders, [](const ScriptHistoryTransaction::Output::Spender& a, const ScriptHistoryTransaction::Output::Spender& b) {
                     const bool a_confirmed{a.block.has_value()};
                     const bool b_confirmed{b.block.has_value()};

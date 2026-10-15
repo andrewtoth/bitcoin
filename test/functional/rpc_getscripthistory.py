@@ -5,7 +5,6 @@
 """Test getscripthistory RPC and txoscriptindex."""
 
 import hashlib
-from copy import deepcopy
 from decimal import Decimal
 
 from test_framework.messages import CTxOut
@@ -49,8 +48,7 @@ class GetScriptHistoryTest(BitcoinTestFramework):
         for verbosity in (0, 1, 2):
             for include_mempool in (False, True):
                 options = {"include_mempool": include_mempool}
-                default = node.getscripthistory(query, verbosity, options)
-                expected = deepcopy(default)
+                expected = node.getscripthistory(query, verbosity, options)
                 expected.pop("spending_transactions", None)
                 # Keep annotations referencing confirmed or mempool matches; only
                 # extra bodies and annotations referencing those extras disappear.
@@ -129,8 +127,49 @@ class GetScriptHistoryTest(BitcoinTestFramework):
         assert_equal([tx["txid"] for tx in history["spending_transactions"]], expected_spenders)
         self.wallet.rescan_utxos()
 
+    def test_shared_spenders(self, node):
+        self.log.info("Shared spenders resolve outputs across funding blocks")
+        query_wallet = MiniWallet(node, tag_name="scripthistory-shared-spenders")
+        funding_txids = []
+        for _ in range(2):
+            tx = self.wallet.create_self_transfer(confirmed_only=True)["tx"]
+            tx.vout[0].nValue -= 4 * 100_000
+            tx.vout.extend(CTxOut(100_000, query_wallet.get_output_script()) for _ in range(4))
+            self.wallet.sign_tx(tx)
+            funding_txids.append(tx.txid_hex)
+            self.generateblock(node, self.wallet.get_address(), [tx.serialize().hex()])
+            self.wallet.rescan_utxos()
+
+        query_wallet.rescan_utxos()
+        utxos = sorted(query_wallet.get_utxos(), key=lambda utxo: (utxo["txid"], utxo["vout"]))
+        assert_equal(len(utxos), 8)
+        # Interleave inputs from both funding blocks and leave one output unspent.
+        expected_spenders = {}
+        for inputs in (utxos[:-1:2], utxos[1:-1:2]):
+            tx = query_wallet.create_self_transfer_multi(utxos_to_spend=inputs)["tx"]
+            tx.vout[0].scriptPubKey = self.wallet.get_output_script()
+            query_wallet.sign_tx(tx)
+            for utxo in inputs:
+                expected_spenders[utxo["txid"], utxo["vout"]] = tx.txid_hex
+            self.generateblock(node, self.wallet.get_address(), [tx.serialize().hex()])
+
+        self.wait_for_indexes(node)
+        history = node.getscripthistory(query_wallet.get_address(), 0, {"include_mempool": False})
+        assert_equal([tx["txid"] for tx in history["transactions"]], funding_txids)
+        assert_equal(set(spending_by_id(history)), set(expected_spenders.values()))
+        for tx in history["transactions"]:
+            assert_equal([output["n"] for output in tx["vout"]], [1, 2, 3, 4])
+            for output in tx["vout"]:
+                spender = expected_spenders.get((tx["txid"], output["n"]))
+                assert_equal(output["spent"], spender is not None)
+                if spender is not None:
+                    assert_equal(output["spending_txid"], spender)
+                else:
+                    assert "spending_txid" not in output
+        self.wallet.rescan_utxos()
+
     def test_serialized_size_limit(self, node):
-        self.log.info("One 50 MiB limit covers descriptor scripts, overlaps, mempool matches, and spenders")
+        self.log.info("Separate 50 MiB limits cover lookup work and unique returned transaction bodies")
         self.restart_node(0, extra_args=self.extra_args[0])
         self.generate(self.wallet, 154)
         self.wallet.rescan_utxos()
@@ -163,16 +202,19 @@ class GetScriptHistoryTest(BitcoinTestFramework):
         limit = 50 * 1024 * 1024
         assert sum(sizes[:53]) < limit < sum(sizes)
         assert sum(stripped_sizes) < limit
-        # Overlaps must be merged before they consume the shared budget.
-        assert_equal(len(node.getscripthistory(descriptor, 0, options)["transactions"]), 53)
         error = f"Script history exceeds the {limit} byte serialized size limit. "
-        confirmed_error = error + "Narrow the range with start_height/end_height."
+        lookup_error = "Script history index lookup limit exceeded while scanning block "
         mempool_error = error + "Set include_mempool=false."
         spender_error = error + "Set include_spending_transactions=false."
+        # Every script fits separately. Together, repeated reads of overlapping
+        # transactions exceed the work budget even though unique bodies fit.
+        assert sum(sizes[:53]) + sum(sizes[:10]) > limit
         for script in scripts:
             assert node.getscripthistory(scripthash(script.hex()), 0)["transactions"]
-        assert_raises_rpc_error(-1, confirmed_error, node.getscripthistory, descriptor)
-        assert_raises_rpc_error(-1, confirmed_error, node.getscripthistory, query_wallet.get_address(), 0,
+        assert_raises_rpc_error(-1, lookup_error, node.getscripthistory, descriptor, 0, options)
+        narrowed = dict(options, end_height=start_height + 39)
+        assert_equal(len(node.getscripthistory(descriptor, 0, narrowed)["transactions"]), 40)
+        assert_raises_rpc_error(-1, f"{lookup_error}{start_height + 53}.", node.getscripthistory, query_wallet.get_address(), 0,
                                 {"include_spending_transactions": False})
 
         query_wallet.rescan_utxos()
@@ -351,27 +393,19 @@ class GetScriptHistoryTest(BitcoinTestFramework):
         spend_block = self.generate(self.wallet, 1)[0]
         self.wait_for_indexes(node0)
 
-        history = node0.getscripthistory(sh)
-        by_id = txs_by_id(history)
-        pay_entry = by_id[pay["txid"]]
-        spent_out = output_by_index(pay_entry, 0)
-        unspent_out = output_by_index(pay_entry, 1)
-        assert_equal(spent_out["spent"], True)
-        assert_equal(spent_out["spending_txid"], spend["txid"])
-        assert_equal(unspent_out["spent"], False)
-        assert "spending_txid" not in unspent_out
-        assert spend["txid"] in by_id
-        assert spend["txid"] not in spending_by_id(history)
-
-        self.log.info("Verbose outputs retain spentness and spender annotations")
-        for verbosity in (True, 2):
-            verbose_by_id = txs_by_id(node0.getscripthistory(sh, verbosity))
-            spent_output = output_by_index(verbose_by_id[pay["txid"]], 0)
-            unspent_output = output_by_index(verbose_by_id[pay["txid"]], 1)
+        self.log.info("All verbosity levels retain spentness and spender annotations")
+        for verbosity in (0, True, 2):
+            history = node0.getscripthistory(sh, verbosity)
+            by_id = txs_by_id(history)
+            pay_entry = by_id[pay["txid"]]
+            spent_output = output_by_index(pay_entry, 0)
+            unspent_output = output_by_index(pay_entry, 1)
             assert_equal(spent_output["spent"], True)
             assert_equal(spent_output["spending_txid"], spend["txid"])
             assert_equal(unspent_output["spent"], False)
             assert "spending_txid" not in unspent_output
+            assert spend["txid"] in by_id
+            assert spend["txid"] not in spending_by_id(history)
 
         self.log.info("Reorg removes disconnected transactions from confirmed history")
         self.nodes[0].invalidateblock(spend_block)
@@ -468,6 +502,7 @@ class GetScriptHistoryTest(BitcoinTestFramework):
         assert_equal(mempool_spenders[mempool_foreign_txid]["hex"], node0.getrawtransaction(mempool_foreign_txid))
         self.check_omitted_spenders(node0, sh)
         self.test_serialized_size_limit(node0)
+        self.test_shared_spenders(node0)
 
         self.log.info("Pruned script history works with only txoscriptindex enabled")
         self.restart_node(0, extra_args=["-txoscriptindex", "-txospenderindex=0", "-txindex=0", "-prune=1", "-fastprune"])
