@@ -10,7 +10,9 @@ from urllib.parse import urlparse
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
     assert_equal,
+    assert_raises_rpc_error,
     sync_txindex,
+    try_rpc,
     JSONRPCException,
 )
 from test_framework.wallet import MiniWallet, getnewdestination
@@ -50,6 +52,10 @@ class TxIndexPruneTest(BitcoinTestFramework):
         self.log.info("Mine enough blocks to prune the transaction's block")
         self.generate(full, 600)
         pruned.pruneblockchain(pruned.getblockcount())
+
+        self.log.info("Pruned UTXO lookups work without txindex")
+        self.restart_node(0, extra_args=["-fastprune", "-prune=1", "-txindex=0"])
+        assert_raises_rpc_error(-1, f"Transaction may be in pruned block {blockhash}.", pruned.gettxoutproof, [txid])
         self.restart_node(0)
         sync_txindex(self, pruned)
         self.connect_nodes(0, 1)
@@ -67,9 +73,7 @@ class TxIndexPruneTest(BitcoinTestFramework):
                 rpc(*rpc_args)
                 raise AssertionError("Expected pruned transaction lookup failure")
             except JSONRPCException as error:
-                assert_equal(error.error["code"], -1)
-                assert_equal(error.error["message"], f"Transaction may be in pruned block {expected_blockhash}.")
-                assert_equal(error.error["data"]["pruned_block_hashes"], [expected_blockhash])
+                assert_equal(error.error, {"code": -1, "message": f"Transaction may be in pruned block {expected_blockhash}.", "data": {"pruned_block_hashes": [expected_blockhash]}})
 
         self.log.info("REST /tx returns the pruned block's hash")
         assert_equal(self.rest_tx(pruned, txid, status=404), f"Transaction may be in pruned block {blockhash}.")
@@ -82,13 +86,9 @@ class TxIndexPruneTest(BitcoinTestFramework):
         self.log.info("Fetch the pruned block and retry RPC, REST, and PSBT lookups")
         pruned.getblockfrompeer(blockhash, pruned.getpeerinfo()[0]["id"])
 
-        def tx_available():
-            try:
-                return pruned.getrawtransaction(txid) == tx["hex"]
-            except JSONRPCException:
-                return False
-        self.wait_until(tx_available)
+        self.wait_until(lambda: not try_rpc(None, None, pruned.getrawtransaction, txid))
         tx_verbose = pruned.getrawtransaction(txid, 2)
+        assert_equal(tx_verbose["hex"], tx["hex"])
         # verbose fields are missing because there's no undo fetched from peer
         assert "fee" not in tx_verbose
         assert "prevout" not in tx_verbose["vin"][0]
@@ -96,6 +96,10 @@ class TxIndexPruneTest(BitcoinTestFramework):
         assert_equal(pruned.verifytxoutproof(pruned.gettxoutproof([txid])), [txid])
         updated = pruned.utxoupdatepsbt(psbt)
         assert "non_witness_utxo" in pruned.decodepsbt(updated)["inputs"][0]
+
+        self.log.info("Recovered transaction lookup survives a restart")
+        self.restart_node(0)
+        assert_equal(pruned.getrawtransaction(txid), tx["hex"])
 
 if __name__ == '__main__':
     TxIndexPruneTest(__file__).main()
