@@ -12,12 +12,12 @@
 #include <dbwrapper.h>
 #include <flatfile.h>
 #include <index/disktxpos.h>
-#include <index/tx_lookup_result.h>
 #include <index/txindex.h>
 #include <index/txindex_key.h>
 #include <interfaces/chain.h>
 #include <key.h>
 #include <node/blockstorage.h>
+#include <node/tx_lookup_result.h>
 #include <primitives/block.h>
 #include <script/script.h>
 #include <streams.h>
@@ -35,7 +35,6 @@
 #include <string>
 #include <string_view>
 #include <utility>
-#include <variant>
 #include <vector>
 
 #include <boost/test/unit_test.hpp>
@@ -88,18 +87,15 @@ FlatFilePos BlockFilePos(const ChainstateManager& chainman, uint32_t height)
 uint256 LookupTx(const TxIndex& txindex, const Txid& txid)
 {
     const auto result{txindex.FindTx(txid)};
-    const auto* found{std::get_if<TxFound>(&result)};
-    BOOST_REQUIRE(found);
-    BOOST_CHECK(found->tx->GetHash() == txid);
-    return found->block_hash;
+    const auto& [tx, block_hash]{*Assert(result.GetFound())};
+    BOOST_CHECK(tx->GetHash() == txid);
+    return block_hash;
 }
 
 void CheckNotFound(const TxIndex& txindex, const Txid& txid, const std::set<uint256>& expected_pruned_block_hashes = {})
 {
     const auto result{txindex.FindTx(txid)};
-    const auto* miss{std::get_if<TxMiss>(&result)};
-    BOOST_REQUIRE(miss);
-    BOOST_CHECK(miss->pruned_block_hashes == expected_pruned_block_hashes);
+    BOOST_CHECK(Assert(result.GetMiss())->pruned_block_hashes == expected_pruned_block_hashes);
 }
 
 void InvalidateBlock(ChainstateManager& chainman, const uint256& block_hash)
@@ -108,6 +104,12 @@ void InvalidateBlock(ChainstateManager& chainman, const uint256& block_hash)
     BOOST_REQUIRE(block_index);
     BlockValidationState state;
     BOOST_REQUIRE(chainman.ActiveChainstate().InvalidateBlock(state, block_index));
+}
+
+void PruneBlock(ChainstateManager& chainman, const uint256& block_hash)
+{
+    LOCK(cs_main);
+    Assert(chainman.m_blockman.LookupBlockIndex(block_hash))->nStatus &= ~BLOCK_HAVE_DATA;
 }
 
 } // namespace
@@ -237,16 +239,10 @@ BOOST_FIXTURE_TEST_CASE(txindex_collision_scan_path, TestChain100Setup)
     db.Write(txindex::LegacyTxKey(fake_txid), fake_physical);
     CheckNotFound(txindex, fake_txid);
 
-    {
-        LOCK(cs_main);
-        Assert(m_node.chainman->m_blockman.LookupBlockIndex(fake_block_hash))->nStatus &= ~BLOCK_HAVE_DATA;
-    }
+    PruneBlock(*m_node.chainman, fake_block_hash);
     BOOST_CHECK(LookupTx(txindex, target_txid) == target_block_hash);
 
-    {
-        LOCK(cs_main);
-        Assert(m_node.chainman->m_blockman.LookupBlockIndex(target_block_hash))->nStatus &= ~BLOCK_HAVE_DATA;
-    }
+    PruneBlock(*m_node.chainman, target_block_hash);
     CheckNotFound(txindex, target_txid, {target_block_hash, fake_block_hash});
 
     StopIndex(txindex, m_node);
@@ -376,11 +372,10 @@ BOOST_FIXTURE_TEST_CASE(txindex_reorg_keeps_stale_entries, TestChain100Setup)
     BOOST_REQUIRE_EQUAL(reorg_bucket.size(), 2U);
     BOOST_CHECK(reorg_bucket.front() == original_bucket.front());
 
-    {
-        LOCK(cs_main);
-        Assert(chainman.m_blockman.LookupBlockIndex(stale_block_hash))->nStatus &= ~BLOCK_HAVE_DATA;
-        Assert(chainman.m_blockman.LookupBlockIndex(branch_block_hash))->nStatus &= ~BLOCK_HAVE_DATA;
-    }
+    PruneBlock(chainman, stale_block_hash);
+    // A readable stale copy still supplies the transaction when the active copy is pruned.
+    BOOST_CHECK(LookupTx(txindex, unique_txid) == branch_block_hash);
+    PruneBlock(chainman, branch_block_hash);
     CheckNotFound(txindex, unique_txid, {stale_block_hash});
 
     StopIndex(txindex, m_node);

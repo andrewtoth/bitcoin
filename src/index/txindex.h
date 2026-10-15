@@ -6,7 +6,7 @@
 #define BITCOIN_INDEX_TXINDEX_H
 
 #include <index/base.h>
-#include <index/tx_lookup_result.h>
+#include <node/tx_lookup_result.h>
 #include <primitives/transaction.h>
 
 #include <cstddef>

@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_INDEX_TX_LOOKUP_RESULT_H
-#define BITCOIN_INDEX_TX_LOOKUP_RESULT_H
+#ifndef BITCOIN_NODE_TX_LOOKUP_RESULT_H
+#define BITCOIN_NODE_TX_LOOKUP_RESULT_H
 
 #include <primitives/transaction.h>
 #include <uint256.h>
@@ -26,6 +26,14 @@ struct TxMiss {
 };
 
 /// Result of a transaction lookup that may be answered by the txindex.
-using TxLookupResult = std::variant<TxFound, TxMiss>;
+struct TxLookupResult : public std::variant<TxFound, TxMiss>
+{
+    using variant::variant;
 
-#endif // BITCOIN_INDEX_TX_LOOKUP_RESULT_H
+    TxFound* GetFound() { return std::get_if<TxFound>(this); }
+    const TxFound* GetFound() const { return std::get_if<TxFound>(this); }
+    TxMiss* GetMiss() { return std::get_if<TxMiss>(this); }
+    const TxMiss* GetMiss() const { return std::get_if<TxMiss>(this); }
+};
+
+#endif // BITCOIN_NODE_TX_LOOKUP_RESULT_H

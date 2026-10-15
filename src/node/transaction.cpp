@@ -6,12 +6,12 @@
 #include <node/transaction.h>
 
 #include <consensus/validation.h>
-#include <index/tx_lookup_result.h>
 #include <index/txindex.h>
 #include <net.h>
 #include <net_processing.h>
 #include <node/blockstorage.h>
 #include <node/context.h>
+#include <node/tx_lookup_result.h>
 #include <node/types.h>
 #include <policy/feerate.h>
 #include <txmempool.h>

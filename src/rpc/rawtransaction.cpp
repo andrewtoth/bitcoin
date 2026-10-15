@@ -15,7 +15,6 @@
 #include <crypto/common.h>
 #include <crypto/hex_base.h>
 #include <hash.h>
-#include <index/tx_lookup_result.h>
 #include <index/txindex.h>
 #include <kernel/chainparams.h>
 #include <key.h>
@@ -25,6 +24,7 @@
 #include <node/context.h>
 #include <node/psbt.h>
 #include <node/transaction.h>
+#include <node/tx_lookup_result.h>
 #include <policy/feerate.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>

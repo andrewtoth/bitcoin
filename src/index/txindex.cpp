@@ -11,10 +11,10 @@
 #include <flatfile.h>
 #include <index/base.h>
 #include <index/disktxpos.h>
-#include <index/tx_lookup_result.h>
 #include <index/txindex_key.h>
 #include <interfaces/chain.h>
 #include <node/blockstorage.h>
+#include <node/tx_lookup_result.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
 #include <random.h>
@@ -170,7 +170,7 @@ TxLookupResult TxIndex::FindTx(const Txid& tx_hash) const
         uint32_t block_seq;
         //! Whether this candidate's block is currently in the active chain.
         //! Active chain candidates are attempted first, so duplicate entries
-        //! in both active and stale blocks will always return the active block hash.
+        //! in both active and stale blocks will return the active block hash if readable.
         bool in_active_chain;
     };
     std::vector<Candidate> candidates;
@@ -192,7 +192,7 @@ TxLookupResult TxIndex::FindTx(const Txid& tx_hash) const
                 continue;
             }
             const bool in_active_chain{m_chainstate->m_chain.Contains(*block_index)};
-            if (!(block_index->nStatus & BLOCK_HAVE_DATA)) {
+            if (~block_index->nStatus & BLOCK_HAVE_DATA) {
                 if (in_active_chain) pruned_block_hashes.insert(candidate_block_hash);
                 continue;
             }
@@ -209,18 +209,20 @@ TxLookupResult TxIndex::FindTx(const Txid& tx_hash) const
     for (const auto& candidate : candidates) {
         AutoFile file{m_chainstate->m_blockman.OpenBlockFile(candidate.tx_position, /*fReadOnly=*/true)};
         if (file.IsNull()) {
+            LOCK(cs_main);
+            const CBlockIndex* block_index{m_chainstate->m_blockman.LookupBlockIndex(candidate.block_hash)};
+            if (block_index && m_chainstate->m_chain.Contains(*block_index) && m_chainstate->m_blockman.IsBlockPruned(*block_index)) {
+                pruned_block_hashes.insert(candidate.block_hash);
+                continue;
+            }
             LogWarning("OpenBlockFile failed for txid %s", tx_hash.ToString());
             continue;
         }
-        CTransactionRef tx;
         try {
-            file >> TX_WITH_WITNESS(tx);
+            auto tx{std::make_shared<const CTransaction>(deserialize, TX_WITH_WITNESS, file)};
+            if (tx->GetHash() == tx_hash) return TxFound{std::move(tx), candidate.block_hash};
         } catch (const std::exception& e) {
             LogWarning("Deserialize or I/O error - %s", e.what());
-            continue;
-        }
-        if (tx->GetHash() == tx_hash) {
-            return TxFound{std::move(tx), candidate.block_hash};
         }
     }
     // Fall back to legacy if no hashed entry matched. This makes misses pay an
