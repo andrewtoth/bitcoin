@@ -6,7 +6,7 @@
 #define BITCOIN_NODE_TRANSACTION_H
 
 #include <common/messages.h>
-#include <index/tx_lookup_result.h>
+#include <node/tx_lookup_result.h>
 #include <node/types.h>
 #include <policy/feerate.h>
 #include <primitives/transaction.h>

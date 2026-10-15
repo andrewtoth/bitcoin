@@ -8,11 +8,11 @@
 #include <chain.h>
 #include <coins.h>
 #include <crypto/hex_base.h>
-#include <index/tx_lookup_result.h>
 #include <index/txindex.h>
 #include <merkleblock.h>
 #include <node/blockstorage.h>
 #include <node/transaction.h>
+#include <node/tx_lookup_result.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
 #include <rpc/blockchain.h>
@@ -32,7 +32,6 @@
 #include <span>
 #include <string>
 #include <utility>
-#include <variant>
 #include <vector>
 
 using node::GetTransaction;
@@ -108,11 +107,10 @@ static RPCMethod gettxoutproof()
 
             if (pblockindex == nullptr) {
                 const TxLookupResult result{GetTransaction(/*block_index=*/nullptr, /*mempool=*/nullptr, *setTxids.begin(), chainman.m_blockman)};
-                const auto* found{std::get_if<TxFound>(&result)};
+                const auto* found{result.GetFound()};
                 if (!found || found->block_hash.IsNull()) {
-                    if (const auto* miss{std::get_if<TxMiss>(&result)}; miss && !miss->pruned_block_hashes.empty()) {
-                        throw JSONRPCError(RPC_MISC_ERROR, PrunedBlocksErrorMessage(miss->pruned_block_hashes),
-                                           PrunedBlocksErrorData(miss->pruned_block_hashes));
+                    if (const auto* miss{result.GetMiss()}; miss && !miss->pruned_block_hashes.empty()) {
+                        throw JSONRPCPrunedBlocksError(miss->pruned_block_hashes);
                     }
                     throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Transaction not yet in block");
                 }
@@ -128,9 +126,7 @@ static RPCMethod gettxoutproof()
             {
                 LOCK(cs_main);
                 if (chainman.m_blockman.IsBlockPruned(*pblockindex)) {
-                    const std::set<uint256> block_hashes{pblockindex->GetBlockHash()};
-                    throw JSONRPCError(RPC_MISC_ERROR, PrunedBlocksErrorMessage(block_hashes),
-                                       PrunedBlocksErrorData(block_hashes));
+                    throw JSONRPCPrunedBlocksError({pblockindex->GetBlockHash()});
                 }
                 CheckBlockDataAvailability(chainman.m_blockman, *pblockindex, /*check_for_undo=*/false);
             }

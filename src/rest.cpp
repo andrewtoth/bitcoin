@@ -14,11 +14,11 @@
 #include <flatfile.h>
 #include <httpserver.h>
 #include <index/blockfilterindex.h>
-#include <index/tx_lookup_result.h>
 #include <index/txindex.h>
 #include <node/blockstorage.h>
 #include <node/context.h>
 #include <node/transaction.h>
+#include <node/tx_lookup_result.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
 #include <rpc/blockchain.h>
@@ -903,15 +903,13 @@ static bool rest_tx(const std::any& context, HTTPRequest* req, const std::string
     const NodeContext* const node = GetNodeContext(context, req);
     if (!node) return false;
     const TxLookupResult result{GetTransaction(/*block_index=*/nullptr, node->mempool.get(), *hash, node->chainman->m_blockman)};
-    if (const auto* miss{std::get_if<TxMiss>(&result)}) {
+    if (const auto* miss{result.GetMiss()}) {
         if (!miss->pruned_block_hashes.empty()) {
             return RESTERR(req, HTTP_NOT_FOUND, PrunedBlocksErrorMessage(miss->pruned_block_hashes));
         }
         return RESTERR(req, HTTP_NOT_FOUND, hashStr + " not found");
     }
-    const auto& found{std::get<TxFound>(result)};
-    const CTransactionRef& tx{found.tx};
-    const uint256& hashBlock{found.block_hash};
+    const auto& [tx, hashBlock]{std::get<TxFound>(result)};
     switch (rf) {
     case RESTResponseFormat::BINARY: {
         DataStream ssTx;

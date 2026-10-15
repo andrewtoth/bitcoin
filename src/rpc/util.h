@@ -149,8 +149,8 @@ UniValue JSONRPCTransactionError(node::TransactionError terr, const std::string&
 
 //! Error message when a transaction lookup only matched blocks whose data was pruned.
 std::string PrunedBlocksErrorMessage(const std::set<uint256>& pruned_block_hashes);
-//! Structured JSON-RPC error.data for a pruned-block transaction lookup miss.
-UniValue PrunedBlocksErrorData(const std::set<uint256>& pruned_block_hashes);
+//! JSON-RPC error for a pruned-block transaction lookup miss.
+UniValue JSONRPCPrunedBlocksError(const std::set<uint256>& pruned_block_hashes);
 
 //! Parse a JSON range specified as int64, or [int64, int64]
 std::pair<int64_t, int64_t> ParseDescriptorRange(const UniValue& value);

@@ -431,7 +431,7 @@ std::string PrunedBlocksErrorMessage(const std::set<uint256>& pruned_block_hashe
     return strprintf("Transaction may be in one of the following pruned blocks: %s.", hashes);
 }
 
-UniValue PrunedBlocksErrorData(const std::set<uint256>& pruned_block_hashes)
+UniValue JSONRPCPrunedBlocksError(const std::set<uint256>& pruned_block_hashes)
 {
     UniValue hashes{UniValue::VARR};
     for (const auto& hash : pruned_block_hashes) {
@@ -439,7 +439,7 @@ UniValue PrunedBlocksErrorData(const std::set<uint256>& pruned_block_hashes)
     }
     UniValue data{UniValue::VOBJ};
     data.pushKV("pruned_block_hashes", std::move(hashes));
-    return data;
+    return JSONRPCError(RPC_MISC_ERROR, PrunedBlocksErrorMessage(pruned_block_hashes), data);
 }
 
 /**

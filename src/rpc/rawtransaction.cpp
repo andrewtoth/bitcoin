@@ -31,6 +31,7 @@
 #include <psbt.h>
 #include <pubkey.h>
 #include <random.h>
+#include <rpc/blockchain.h>
 #include <rpc/protocol.h>
 #include <rpc/rawtransaction_util.h>
 #include <rpc/request.h>
@@ -177,8 +178,7 @@ PartiallySignedTransaction ProcessPSBT(const std::string& psbt_string, const std
         // The `non_witness_utxo` is the whole previous transaction
         if (psbt_input.non_witness_utxo) continue;
 
-        TxLookupResult result{GetTransaction(/*block_index=*/nullptr, node.mempool.get(), psbt_input.prev_txid, chainman.m_blockman)};
-        if (auto* found{std::get_if<TxFound>(&result)}) {
+        if (auto result{GetTransaction(/*block_index=*/nullptr, node.mempool.get(), psbt_input.prev_txid, chainman.m_blockman)}; auto* found{result.GetFound()}) {
             psbt_input.non_witness_utxo = std::move(found->tx);
         } else {
             coins[psbt_input.GetOutPoint()]; // Create empty map entry keyed by prevout
@@ -325,22 +325,17 @@ static RPCMethod getrawtransaction()
     }
 
     const TxLookupResult tx_result{GetTransaction(blockindex, node.mempool.get(), txid, chainman.m_blockman)};
-    if (const auto* miss{std::get_if<TxMiss>(&tx_result)}) {
+    if (const auto* miss{tx_result.GetMiss()}) {
         if (!miss->pruned_block_hashes.empty()) {
-            throw JSONRPCError(RPC_MISC_ERROR, PrunedBlocksErrorMessage(miss->pruned_block_hashes),
-                               PrunedBlocksErrorData(miss->pruned_block_hashes));
+            throw JSONRPCPrunedBlocksError(miss->pruned_block_hashes);
         }
         std::string errmsg;
         if (blockindex) {
             LOCK(cs_main);
             if (chainman.m_blockman.IsBlockPruned(*blockindex)) {
-                const std::set<uint256> block_hashes{blockindex->GetBlockHash()};
-                throw JSONRPCError(RPC_MISC_ERROR, PrunedBlocksErrorMessage(block_hashes),
-                                   PrunedBlocksErrorData(block_hashes));
+                throw JSONRPCPrunedBlocksError({blockindex->GetBlockHash()});
             }
-            if (!(blockindex->nStatus & BLOCK_HAVE_DATA)) {
-                throw JSONRPCError(RPC_MISC_ERROR, "Block not available");
-            }
+            CheckBlockDataAvailability(chainman.m_blockman, *blockindex, /*check_for_undo=*/false);
             errmsg = "No such transaction found in the provided block";
         } else if (!g_txindex) {
             errmsg = "No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries";
@@ -351,9 +346,7 @@ static RPCMethod getrawtransaction()
         }
         throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, errmsg + ". Use gettransaction for wallet transactions.");
     }
-    const auto& found{std::get<TxFound>(tx_result)};
-    const CTransactionRef& tx{found.tx};
-    const uint256& hash_block{found.block_hash};
+    const auto& [tx, hash_block]{std::get<TxFound>(tx_result)};
 
     if (verbosity <= 0) {
         return EncodeHexTx(*tx);
