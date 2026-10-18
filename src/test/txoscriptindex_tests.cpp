@@ -7,7 +7,6 @@
 #include <consensus/amount.h>
 #include <crypto/hex_base.h>
 #include <dbwrapper.h>
-#include <index/ordered_varint.h>
 #include <index/txoscriptindex.h>
 #include <index/txoscriptindex_key.h>
 #include <interfaces/chain.h>
@@ -21,10 +20,9 @@
 #include <util/byte_units.h>
 #include <validation.h>
 
-#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <ios>
-#include <iterator>
 #include <limits>
 #include <string>
 #include <utility>
@@ -40,89 +38,30 @@ public:
     static CDBWrapper& GetDB(const TxoScriptIndex& index) { return index.GetDB(); }
 };
 
-static std::vector<std::byte> EncodeOrderedVarInt(uint64_t value)
+BOOST_AUTO_TEST_CASE(txoscriptindex_key_encoding)
 {
-    DataStream stream;
-    stream << Using<OrderedVarIntFormatter>(value);
-    return {stream.begin(), stream.end()};
-}
+    // Pin the complete persisted key format.
+    BOOST_CHECK_EQUAL(HexStr(DataStream{} << txoscriptindex::DBKey{0x0102030405, 128, 81}), "780102030405000080000051");
 
-static uint64_t DecodeOrderedVarInt(const std::vector<std::byte>& bytes)
-{
-    DataStream stream{bytes};
-    uint64_t value{0};
-    stream >> Using<OrderedVarIntFormatter>(value);
-    BOOST_CHECK(stream.empty());
-    return value;
-}
-
-BOOST_AUTO_TEST_CASE(ordered_varint_exact_encoding_and_roundtrip)
-{
-    const struct {
-        uint64_t value;
-        std::string encoded;
-    } cases[]{
-        {0, "00"},
-        {127, "7f"},
-        {128, "8000"},
-        {16511, "bfff"},
-        {16512, "c00000"},
-        {2'000'000, "de4400"},
-        {2'113'663, "dfffff"},
-        {2'113'664, "e0000000"},
-        {270'549'119, "efffffff"},
-        {270'549'120, "f000000000"},
-        {4'000'000'000ULL, "f0de4ae780"},
-        {std::numeric_limits<uint32_t>::max(), "f0efdfbf7f"},
-        {OrderedVarIntFormatter::MAX_5, "f7ffffffff"},
-    };
-    for (const auto& [value, encoded] : cases) {
-        const auto bytes{EncodeOrderedVarInt(value)};
-        BOOST_CHECK_EQUAL(HexStr(bytes), encoded);
-        BOOST_CHECK_EQUAL(DecodeOrderedVarInt(bytes), value);
-    }
-
-    // Pin the complete persisted key format as well as the height encoding.
-    BOOST_CHECK_EQUAL(HexStr(DataStream{} << txoscriptindex::DBKey{0x0102030405, 128, 81}), "7801020304058000000051");
-}
-
-BOOST_AUTO_TEST_CASE(ordered_varint_invalid_encodings)
-{
-    // Exercise every truncation length for each supported encoding size.
-    for (const uint64_t value : {uint64_t{0}, uint64_t{128}, uint64_t{16512}, uint64_t{2'113'664}, OrderedVarIntFormatter::MAX_5}) {
-        const auto bytes{EncodeOrderedVarInt(value)};
-        for (size_t size{0}; size < bytes.size(); ++size) {
-            BOOST_CHECK_THROW(DecodeOrderedVarInt({bytes.begin(), bytes.begin() + size}), std::ios_base::failure);
-        }
-    }
-    for (uint32_t prefix{0xf8}; prefix <= 0xff; ++prefix) {
-        BOOST_CHECK_THROW(DecodeOrderedVarInt({static_cast<std::byte>(prefix), std::byte{0}, std::byte{0}, std::byte{0}, std::byte{0}}), std::ios_base::failure);
-    }
-    BOOST_CHECK_THROW(EncodeOrderedVarInt(OrderedVarIntFormatter::MAX_5 + 1), std::ios_base::failure);
-    BOOST_CHECK_THROW(EncodeOrderedVarInt(std::numeric_limits<uint64_t>::max()), std::ios_base::failure);
-
-    uint32_t decoded{0};
-    DataStream maximum{EncodeOrderedVarInt(std::numeric_limits<uint32_t>::max())};
-    maximum >> Using<OrderedVarIntFormatter>(decoded);
-    BOOST_CHECK_EQUAL(decoded, std::numeric_limits<uint32_t>::max());
-    DataStream overflow{EncodeOrderedVarInt(uint64_t{std::numeric_limits<uint32_t>::max()} + 1)};
-    BOOST_CHECK_THROW(overflow >> Using<OrderedVarIntFormatter>(decoded), std::ios_base::failure);
-    BOOST_CHECK_EQUAL(decoded, std::numeric_limits<uint32_t>::max());
-}
-
-BOOST_AUTO_TEST_CASE(ordered_varint_lexicographic_order)
-{
-    const uint64_t values[]{
-        0, 1, 126, 127, 128, 255, 16'511, 16'512, 16'513,
-        2'000'000, 2'113'663, 2'113'664, 270'549'119, 270'549'120, 4'000'000'000ULL,
-        std::numeric_limits<uint32_t>::max(), OrderedVarIntFormatter::MAX_5,
-    };
-    auto previous{EncodeOrderedVarInt(values[0])};
-    for (size_t i{1}; i < std::size(values); ++i) {
-        auto encoded{EncodeOrderedVarInt(values[i])};
+    std::vector<std::byte> previous;
+    for (const uint32_t height : {0U, 127U, 128U, 255U, 256U, 65'535U, 65'536U, 1'000'000U, 0xffffffU}) {
+        const txoscriptindex::DBKey key{0x0102030405, height, 81};
+        DataStream stream;
+        stream << key;
+        const std::vector<std::byte> encoded{stream.begin(), stream.end()};
+        BOOST_CHECK_EQUAL(encoded.size(), 12);
         BOOST_CHECK(previous < encoded);
-        previous = std::move(encoded);
+        previous = encoded;
+
+        txoscriptindex::DBKey decoded;
+        stream >> decoded;
+        BOOST_CHECK(stream.empty());
+        BOOST_CHECK_EQUAL(decoded.hash_prefix, key.hash_prefix);
+        BOOST_CHECK_EQUAL(decoded.height, key.height);
+        BOOST_CHECK_EQUAL(decoded.tx_offset_in_block, key.tx_offset_in_block);
     }
+    const txoscriptindex::DBKey overflow{0x0102030405, 0x1000000, 81};
+    BOOST_CHECK_THROW(DataStream{} << overflow, std::ios_base::failure);
 }
 
 BOOST_FIXTURE_TEST_CASE(txoscriptindex_initial_sync, TestChain100Setup)

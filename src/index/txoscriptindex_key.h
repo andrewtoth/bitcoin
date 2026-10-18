@@ -7,7 +7,6 @@
 
 #include <consensus/consensus.h>
 #include <crypto/siphash.h>
-#include <index/ordered_varint.h>
 #include <serialize.h>
 #include <uint256.h>
 
@@ -27,7 +26,8 @@ namespace txoscriptindex {
  *   ['B']                                 -> sync locator
  *
  * hash prefix is SipHash-1-3-UJ of SHA256(scriptPubKey), truncated to 5 bytes.
- * height is an OrderedVarInt so prefix+height range seeks are height-ordered.
+ * height is 3-byte big-endian so prefix+height range seeks are height-ordered.
+ * The maximum supported height is 16,777,215.
  * One key is stored per distinct prefix in a transaction (not per output).
  */
 
@@ -62,7 +62,7 @@ struct DBKey {
             throw std::ios_base::failure("Invalid format for txoscriptindex DB key");
         }
         READWRITE(Using<BigEndianFormatter<HASH_PREFIX_SIZE>>(obj.hash_prefix),
-                  Using<OrderedVarIntFormatter>(obj.height),
+                  Using<BigEndianFormatter<3>>(obj.height),
                   Using<BigEndianFormatter<TX_OFFSET_SIZE>>(obj.tx_offset_in_block));
     }
 };
